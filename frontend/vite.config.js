@@ -25,7 +25,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../dist', // Build to parent directory for Flask to serve
+    outDir: 'dist', // Build to parent directory for Flask to serve
     assetsDir: 'assets',
     sourcemap: false,
     emptyOutDir: true,
