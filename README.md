@@ -91,7 +91,7 @@ A comprehensive web-based platform for students to prepare for technical and non
 
 - **Frontend**: HTML, CSS, Vanilla JavaScript
 - **Backend**: Python Flask
-- **Database**: SQLite (can be migrated to PostgreSQL)
+- **Database**: MySQL (with PyMySQL connector)
 - **Authentication**: JWT (Flask-JWT-Extended)
 - **Code Execution**: Online compiler API (JDoodle) or local Python execution
 - **AI Chatbot**: OpenAI API (or fallback rule-based system)
@@ -168,6 +168,28 @@ A comprehensive web-based platform for students to prepare for technical and non
 
 ### Database Initialization
 
+1. **Setup Database**
+   ```bash
+   cd backend
+   python setup_database.py
+   ```
+
+2. **Run Migrations**
+   ```bash
+   python migrate_assessments.py
+   python migrate_module_type.py
+   ```
+
+3. **Test Connection**
+   ```bash
+   python test_connection.py
+   ```
+
+4. **Start Server**
+   ```bash
+   python app.py
+   ```
+
 The database is automatically initialized when you first run the Flask app. Sample data (seed data) will be created including:
 - Admin user: `admin` / `admin123`
 - Faculty user: `faculty1` / `faculty123`
@@ -175,6 +197,11 @@ The database is automatically initialized when you first run the Flask app. Samp
 - Sample companies (Google, Microsoft, Amazon, etc.)
 - Sample coding questions
 - Sample MCQ and fill-in-the-blank questions
+
+**Database Configuration:**
+- Default: MySQL on `localhost:3306`
+- Database name: `cursor_platform`
+- Configure in `backend/.env` file (see `.env.example`)
 
 ## 🚀 Usage
 

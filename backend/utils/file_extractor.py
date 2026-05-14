@@ -57,6 +57,24 @@ def extract_text_from_image(file_path):
     except Exception as e:
         return f"Error processing image: {str(e)}"
 
+def extract_text_from_docx(file_path):
+    """
+    Extract text from DOCX file
+    Returns extracted text as string
+    """
+    try:
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            text = []
+            for paragraph in doc.paragraphs:
+                text.append(paragraph.text)
+            return '\n'.join(text).strip()
+        except ImportError:
+            return "DOCX extraction requires python-docx library. Please install: pip install python-docx"
+    except Exception as e:
+        return f"Error extracting DOCX text: {str(e)}"
+
 def extract_text_from_file(file_path, file_extension):
     """
     Extract text from file based on extension
@@ -68,6 +86,15 @@ def extract_text_from_file(file_path, file_extension):
         return extract_text_from_pdf(file_path)
     elif ext in ['jpg', 'jpeg', 'png']:
         return extract_text_from_image(file_path)
+    elif ext in ['docx', 'doc']:
+        return extract_text_from_docx(file_path)
+    elif ext == 'txt':
+        # Plain text file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            return f"Error reading text file: {str(e)}"
     else:
-        return f"Unsupported file type: {ext}. Supported types: PDF, JPG, PNG"
+        return f"Unsupported file type: {ext}. Supported types: PDF, DOCX, TXT, JPG, PNG"
 

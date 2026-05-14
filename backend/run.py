@@ -1,12 +1,19 @@
 """
-Run script for the Flask application
+Run script for Flask application
 """
 from app import create_app
+import os
+
+# Create Flask app
+app = create_app()
 
 if __name__ == '__main__':
-    app = create_app('development')
-    print("Starting Interview Preparation Platform...")
-    print("Backend running on http://localhost:5000")
-    print("Open frontend/index.html in your browser or use a local server")
-    app.run(debug=True, host='0.0.0.0', port=5000)
-
+    # Get port from environment or default to 5000
+    port = int(os.environ.get('PORT', 5000))
+    
+    # Run Flask app
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=os.environ.get('FLASK_ENV') == 'development'
+    )

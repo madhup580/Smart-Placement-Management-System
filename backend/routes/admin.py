@@ -3,9 +3,11 @@ Admin routes
 """
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import User, Company, Question, CodeSubmission, QuizAttempt, db
+from models import User, Company, Question, CodeSubmission, QuizAttempt, Batch, db
 from utils.auth import role_required
 from sqlalchemy import func
+from datetime import datetime
+import json
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -88,6 +90,14 @@ def update_user(user_id):
             user.role = data['role']
         if 'full_name' in data:
             user.full_name = data['full_name']
+        if 'batch_id' in data:
+            # Only admin can change batch
+            batch_id = data['batch_id']
+            if batch_id is not None:
+                batch = Batch.query.get(batch_id)
+                if not batch:
+                    return jsonify({'error': 'Invalid batch_id'}), 400
+            user.batch_id = batch_id
         
         db.session.commit()
         
@@ -104,8 +114,10 @@ def update_user(user_id):
 @jwt_required()
 @role_required(['admin'])
 def delete_user(user_id):
-    """Delete user"""
+    """Delete user and all associated data"""
     try:
+        from models import Leaderboard, CodeSubmission, QuizAttempt, Post, Resource, Notification, InterviewSession, ResumeData, JobDescriptionData, InterviewAnswer, InterviewResult
+        
         user = User.query.get_or_404(user_id)
         
         # Don't allow deleting yourself
@@ -113,16 +125,47 @@ def delete_user(user_id):
         if user.id == current_user_id:
             return jsonify({'error': 'Cannot delete your own account'}), 400
         
+        # Delete related data in correct order to avoid foreign key constraint violations
+        # 1. Delete InterviewSession related data first
+        sessions_to_delete = InterviewSession.query.filter_by(user_id=user_id).all()
+        session_ids = [s.id for s in sessions_to_delete]
+        if session_ids:
+            InterviewResult.query.filter(InterviewResult.session_id.in_(session_ids)).delete(synchronize_session=False)
+            InterviewAnswer.query.filter(InterviewAnswer.session_id.in_(session_ids)).delete(synchronize_session=False)
+            ResumeData.query.filter(ResumeData.session_id.in_(session_ids)).delete(synchronize_session=False)
+            JobDescriptionData.query.filter(JobDescriptionData.session_id.in_(session_ids)).delete(synchronize_session=False)
+            InterviewSession.query.filter(InterviewSession.id.in_(session_ids)).delete(synchronize_session=False)
+        
+        # 2. Delete Leaderboard entry
+        Leaderboard.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 3. Delete CodeSubmissions
+        CodeSubmission.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 4. Delete QuizAttempts
+        QuizAttempt.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 5. Delete Posts
+        Post.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 6. Delete Resources
+        Resource.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 7. Delete Notifications
+        Notification.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        
+        # 8. Finally, delete the user
         db.session.delete(user)
         db.session.commit()
         
         return jsonify({
-            'message': 'User deleted successfully'
+            'message': 'User and all associated data deleted successfully'
         }), 200
     
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 @admin_bp.route('/companies', methods=['POST'])
 @jwt_required()
@@ -252,5 +295,80 @@ def reject_question(question_id):
     
     except Exception as e:
         db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+# ==================== ADMIN PRIVILEGES - Faculty Management ====================
+
+@admin_bp.route('/faculty', methods=['GET'])
+@jwt_required()
+@role_required(['admin'])
+def list_faculty():
+    """List all faculty members"""
+    try:
+        faculty = User.query.filter_by(role='faculty').all()
+        return jsonify({
+            'faculty': [f.to_dict() for f in faculty]
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@admin_bp.route('/faculty/<int:faculty_id>', methods=['PUT'])
+@jwt_required()
+@role_required(['admin'])
+def update_faculty(faculty_id):
+    """Update faculty member (activate/deactivate)"""
+    try:
+        faculty = User.query.get_or_404(faculty_id)
+        if faculty.role != 'faculty':
+            return jsonify({'error': 'User is not a faculty member'}), 400
+        
+        data = request.get_json()
+        if 'is_active' in data:
+            faculty.is_active = data['is_active']
+        
+        db.session.commit()
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Faculty updated successfully',
+            'faculty': faculty.to_dict()
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@admin_bp.route('/activity-logs', methods=['GET'])
+@jwt_required()
+@role_required(['admin'])
+def get_all_activity_logs():
+    """Get all activity logs (admin has full access)"""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 100, type=int)
+        activity_type = request.args.get('activity_type')
+        entity_type = request.args.get('entity_type')
+        
+        query = ActivityLog.query
+        
+        if activity_type:
+            query = query.filter_by(activity_type=activity_type)
+        if entity_type:
+            query = query.filter_by(entity_type=entity_type)
+        
+        logs = query.order_by(ActivityLog.created_at.desc()).paginate(
+            page=page, per_page=per_page, error_out=False
+        )
+        
+        return jsonify({
+            'logs': [log.to_dict() for log in logs.items],
+            'total': logs.total,
+            'page': page,
+            'per_page': per_page,
+            'pages': logs.pages
+        }), 200
+    
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 

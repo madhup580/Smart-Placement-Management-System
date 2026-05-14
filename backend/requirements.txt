@@ -1,8 +1,15 @@
 # Core Flask Framework
 Flask==3.0.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
 Flask-CORS==4.0.0
 Flask-SQLAlchemy==3.1.1
 Flask-JWT-Extended==4.6.0
+Flask-Limiter==3.5.0
+Flask-WTF==1.2.1
+WTForms==3.1.1
 Werkzeug==3.0.1
 
 # Database
@@ -27,6 +34,57 @@ python-dotenv==1.0.0
 
 # Production Server (for Railway/Render)
 gunicorn==21.2.0
+
+# OAuth for Google Login
+authlib==1.2.1
+
+# OpenAI API for AI Chatbot
+openai>=1.12.0
+
+# PDF Generation
+reportlab==4.0.7
+
+# Computer Vision & Object Detection
+opencv-python==4.8.1.78
+ultralytics>=8.4.0
+numpy>=1.26.0,<2.0.0
+
+# Face Recognition (optional - will use fallback if not available)
+insightface>=0.7.3
+onnxruntime>=1.16.0
+
+
+# Advanced NLP for Resume Processing (Optional - will use fallback if not available)
+# Note: spacy may have pydantic compatibility issues - system will use fallback methods
+# spacy>=3.7.0  # Commented out due to pydantic v2 compatibility - uncomment if you install compatible version
+sentence-transformers>=2.2.0  # Optional
+keybert>=0.8.0  # Optional
+python-docx>=1.1.0  # Optional
+pdfplumber>=0.10.0  # Optional
+
+
+# Audio Processing (optional - will use basic signal processing if not available)
+librosa>=0.10.0
+
+# WebSocket Support for Live Proctoring
+flask-socketio>=5.3.0
+python-socketio>=5.10.0
+
+# Background Task Processing
+celery>=5.3.0  # Optional - for distributed task queue
+redis>=5.0.0   # Optional - for Celery broker (can use threading without Redis)
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+httpx>=0.25.0
+locust>=2.17.0
+
+# Code Quality
+flake8>=6.1.0
+black>=23.11.0
+isort>=5.12.0
 
 # Note: Standard library modules (json, os, subprocess, tempfile, time, platform, re, ast, datetime, etc.)
 # are part of Python and don't need to be installed separately.

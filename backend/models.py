@@ -2,7 +2,7 @@
 Database models for the Interview Preparation Platform
 """
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from datetime import datetime, date, time
 from werkzeug.security import generate_password_hash, check_password_hash
 import json
 import pymysql
@@ -16,24 +16,66 @@ db = SQLAlchemy()
 # Note: SQLALCHEMY_ENGINE_OPTIONS from config.py will be automatically used
 # by Flask-SQLAlchemy when db.init_app() is called
 
+class DeviceDetectionLog(db.Model):
+    """Log of device detections during interviews"""
+    __tablename__ = 'device_detection_logs'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    session_id = db.Column(db.String(100), nullable=True, index=True)  # Interview session ID
+    detected_device = db.Column(db.String(50), nullable=False)  # 'cell phone', 'laptop', etc.
+    confidence = db.Column(db.Float, nullable=False)
+    warning_count = db.Column(db.Integer, default=1)  # Number of warnings for this session
+    detected_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationships
+    user = db.relationship('User', backref='device_detections', lazy=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'session_id': self.session_id,
+            'detected_device': self.detected_device,
+            'confidence': self.confidence,
+            'warning_count': self.warning_count,
+            'detected_at': self.detected_at.isoformat() if self.detected_at else None
+        }
+
 class User(db.Model):
     """User model for Students, Faculty, and Admins"""
     __tablename__ = 'users'
     
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False, index=True)
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
+    first_name = db.Column(db.String(50), nullable=False)
+    last_name = db.Column(db.String(50), nullable=False)
+    reg_no = db.Column(db.String(50), unique=True, nullable=True, index=True)  # Registration number
+    college_email = db.Column(db.String(120), unique=True, nullable=False, index=True)  # Must end with @audisankara.ac.in
+    email = db.Column(db.String(120), unique=True, nullable=True, index=True)  # Optional, for Google OAuth
+    password_hash = db.Column(db.String(255), nullable=True)  # Nullable for Google OAuth users
     role = db.Column(db.String(20), nullable=False)  # 'student', 'faculty', 'admin'
-    full_name = db.Column(db.String(100))
+    full_name = db.Column(db.String(100))  # Computed from first_name + last_name
+    google_id = db.Column(db.String(255), unique=True, nullable=True, index=True)  # For Google OAuth
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey('batches.id'), nullable=True, index=True)  # Batch assignment
     
     # Relationships
-    submissions = db.relationship('CodeSubmission', backref='user', lazy=True, cascade='all, delete-orphan')
+    # Specify primaryjoin to avoid ambiguity (CodeSubmission has both user_id and evaluated_by)
+    submissions = db.relationship(
+        'CodeSubmission',
+        primaryjoin='User.id == CodeSubmission.user_id',
+        backref=db.backref('user', lazy=True),
+        lazy=True,
+        cascade='all, delete-orphan'
+    )
     quiz_attempts = db.relationship('QuizAttempt', backref='user', lazy=True, cascade='all, delete-orphan')
     resources = db.relationship('Resource', backref='user', lazy=True, cascade='all, delete-orphan')
     notifications = db.relationship('Notification', backref='user', lazy=True, cascade='all, delete-orphan')
+    chat_history = db.relationship('ChatHistory', backref='user', lazy=True, cascade='all, delete-orphan')
+    usage_stats = db.relationship('UsageStats', backref='user', lazy=True, cascade='all, delete-orphan')
+    activity_logs = db.relationship('ActivityLog', backref='user', lazy=True, cascade='all, delete-orphan')
     
     def set_password(self, password):
         """Hash and set password"""
@@ -48,11 +90,17 @@ class User(db.Model):
         return {
             'id': self.id,
             'username': self.username,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'reg_no': self.reg_no,
+            'college_email': self.college_email,
             'email': self.email,
             'role': self.role,
-            'full_name': self.full_name,
+            'full_name': self.full_name or f"{self.first_name} {self.last_name}",
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'is_active': self.is_active
+            'is_active': self.is_active,
+            'batch_id': self.batch_id,
+            'batch_name': self.batch.name if self.batch else None
         }
 
 class Company(db.Model):
@@ -87,6 +135,7 @@ class Question(db.Model):
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=False)
     type = db.Column(db.String(20), nullable=False)  # 'coding', 'mcq', 'fill_blank'
+    module_type = db.Column(db.String(50), nullable=False, default='CodePractice', index=True)  # 'CodePractice', 'Non-Technical', 'Interview', 'Resources'
     difficulty = db.Column(db.String(20))  # 'easy', 'medium', 'hard'
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'))
     tags = db.Column(db.String(200))  # Comma-separated tags
@@ -111,12 +160,18 @@ class Question(db.Model):
     submissions = db.relationship('CodeSubmission', backref='question', lazy=True)
     quiz_questions = db.relationship('QuizQuestion', backref='question', lazy=True)
     
-    def to_dict(self):
+    def to_dict(self, hide_test_cases=False):
+        """
+        Convert question to dictionary
+        hide_test_cases is kept for older callers; coding practice now exposes
+        the same visible test cases to all roles.
+        """
         data = {
             'id': self.id,
             'title': self.title,
             'description': self.description,
             'type': self.type,
+            'module_type': self.module_type,
             'difficulty': self.difficulty,
             'company_id': self.company_id,
             'company_name': self.company.name if self.company else None,
@@ -126,7 +181,9 @@ class Question(db.Model):
         }
         
         if self.type == 'coding':
-            data['test_cases'] = json.loads(self.test_cases) if self.test_cases else []
+            test_cases = json.loads(self.test_cases) if self.test_cases else []
+            data['test_cases'] = test_cases
+            data['sample_test_cases'] = [test_cases[0]] if test_cases else []
             data['starter_code'] = self.starter_code
         elif self.type == 'mcq':
             data['options'] = json.loads(self.options) if self.options else []
@@ -153,6 +210,12 @@ class CodeSubmission(db.Model):
     test_cases_passed = db.Column(db.Integer, default=0)
     total_test_cases = db.Column(db.Integer, default=0)
     submitted_at = db.Column(db.DateTime, default=datetime.utcnow)
+    evaluation_comment = db.Column(db.Text)  # Manual evaluation comment from faculty
+    evaluated_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # Faculty/admin who evaluated
+    evaluated_at = db.Column(db.DateTime, nullable=True)  # When manual evaluation was done
+    
+    # Relationship for evaluator
+    evaluator = db.relationship('User', foreign_keys=[evaluated_by], backref='evaluated_submissions', lazy=True)
     
     def to_dict(self):
         return {
@@ -167,8 +230,127 @@ class CodeSubmission(db.Model):
             'memory_used': self.memory_used,
             'test_cases_passed': self.test_cases_passed,
             'total_test_cases': self.total_test_cases,
-            'submitted_at': self.submitted_at.isoformat() if self.submitted_at else None
+            'submitted_at': self.submitted_at.isoformat() if self.submitted_at else None,
+            'evaluation_comment': self.evaluation_comment,
+            'evaluated_by': self.evaluated_by,
+            'evaluated_by_name': self.evaluator.full_name if self.evaluator else None,
+            'evaluated_at': self.evaluated_at.isoformat() if self.evaluated_at else None
         }
+
+class Assessment(db.Model):
+    """Assessment model for creating coding tests and non-technical quizzes"""
+    __tablename__ = 'assessments'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    assessment_mode = db.Column(db.String(50), nullable=False, default='mixed')  # 'technical_only', 'non_technical_only', 'mixed'
+    module_type = db.Column(db.String(50), nullable=False, default='Non-Technical', index=True)  # 'CodePractice', 'Non-Technical', 'Interview', 'Resources'
+    start_date = db.Column(db.Date, nullable=False)  # Start date for assessment
+    end_date = db.Column(db.Date, nullable=False)  # End date for assessment
+    start_time = db.Column(db.Time, nullable=False)  # Start time for assessment
+    end_time = db.Column(db.Time, nullable=False)  # End time for assessment
+    difficulty = db.Column(db.String(20), nullable=False)  # 'easy', 'medium', 'hard'
+    topic_tags = db.Column(db.String(500))  # Comma-separated tags: DSA, OOPS, DBMS, OS, CN, Aptitude, HR, etc.
+    status = db.Column(db.String(20), default='draft')  # 'draft', 'published'
+    total_marks = db.Column(db.Integer, default=0)  # Total marks for the assessment
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    published_at = db.Column(db.DateTime, nullable=True)  # When assessment was published
+    is_active = db.Column(db.Boolean, default=True)
+    assigned_batches = db.Column(db.Text)  # JSON string of batch IDs: [1, 2] or [1] or [2], null means all batches
+    
+    # Relationships
+    questions = db.relationship('AssessmentQuestion', backref='assessment', lazy=True, cascade='all, delete-orphan', order_by='AssessmentQuestion.order')
+    attempts = db.relationship('AssessmentAttempt', backref='assessment', lazy=True)
+    
+    def to_dict(self):
+        technical_count = len([q for q in self.questions if q.question and q.question.type == 'coding']) if self.questions else 0
+        non_technical_count = len([q for q in self.questions if q.question and q.question.type in ['mcq', 'fill_blank']]) if self.questions else 0
+        
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'assessment_mode': self.assessment_mode,
+            'module_type': self.module_type,
+            'start_date': self.start_date.isoformat() if self.start_date else None,
+            'end_date': self.end_date.isoformat() if self.end_date else None,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'difficulty': self.difficulty,
+            'topic_tags': self.topic_tags.split(',') if self.topic_tags else [],
+            'status': self.status,
+            'total_marks': self.total_marks,
+            'created_by': self.created_by,
+            'created_by_name': self.creator.full_name if self.creator else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'published_at': self.published_at.isoformat() if self.published_at else None,
+            'is_active': self.is_active,
+            'assigned_batches': json.loads(self.assigned_batches) if self.assigned_batches else None,  # None means all batches
+            'question_count': len(self.questions) if self.questions else 0,
+            'technical_count': technical_count,
+            'non_technical_count': non_technical_count
+        }
+    
+    # Relationship for creator
+    creator = db.relationship('User', foreign_keys=[created_by], backref='created_assessments', lazy=True)
+
+class AssessmentQuestion(db.Model):
+    """Many-to-many relationship between Assessment and Question"""
+    __tablename__ = 'assessment_questions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    assessment_id = db.Column(db.Integer, db.ForeignKey('assessments.id'), nullable=False)
+    question_id = db.Column(db.Integer, db.ForeignKey('questions.id'), nullable=False)
+    order = db.Column(db.Integer, default=0)  # Order of question in assessment
+    marks = db.Column(db.Integer, default=10)  # Marks for this question in the assessment
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'assessment_id': self.assessment_id,
+            'question_id': self.question_id,
+            'question': self.question.to_dict() if self.question else None,
+            'order': self.order,
+            'marks': self.marks
+        }
+    
+    # Relationship
+    question = db.relationship('Question', backref='assessment_questions', lazy=True)
+
+class AssessmentAttempt(db.Model):
+    """Assessment attempt model for tracking student submissions"""
+    __tablename__ = 'assessment_attempts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    assessment_id = db.Column(db.Integer, db.ForeignKey('assessments.id'), nullable=False)
+    answers = db.Column(db.Text)  # JSON string of answers
+    score = db.Column(db.Float, default=0)
+    total_marks = db.Column(db.Float)
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    submitted_at = db.Column(db.DateTime)
+    time_taken_minutes = db.Column(db.Integer)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.full_name if self.user else None,
+            'user_email': self.user.college_email if self.user else None,
+            'user_reg_no': self.user.reg_no if self.user else None,
+            'assessment_id': self.assessment_id,
+            'answers': json.loads(self.answers) if self.answers else {},
+            'score': self.score,
+            'total_marks': self.total_marks,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'submitted_at': self.submitted_at.isoformat() if self.submitted_at else None,
+            'time_taken_minutes': self.time_taken_minutes
+        }
+    
+    # Relationship
+    user = db.relationship('User', backref='assessment_attempts', lazy=True)
 
 class Quiz(db.Model):
     """Quiz model for creating assessments"""
@@ -177,18 +359,22 @@ class Quiz(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
-    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'))
     duration_minutes = db.Column(db.Integer, default=60)
     total_marks = db.Column(db.Integer, default=100)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     start_time = db.Column(db.DateTime)
     end_time = db.Column(db.DateTime)
+    deadline = db.Column(db.DateTime)  # Deadline for quiz submission
+    assignment_type = db.Column(db.String(20), default='entire_batch')  # 'entire_batch' or 'selected_students'
+    lock_after_deadline = db.Column(db.Boolean, default=True)  # Lock quiz after deadline
     is_active = db.Column(db.Boolean, default=True)
     
     # Relationships
     questions = db.relationship('QuizQuestion', backref='quiz', lazy=True, cascade='all, delete-orphan')
     attempts = db.relationship('QuizAttempt', backref='quiz', lazy=True)
+    assignments = db.relationship('QuizAssignment', backref='quiz', lazy=True, cascade='all, delete-orphan')
     
     def to_dict(self):
         return {
@@ -203,8 +389,19 @@ class Quiz(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'start_time': self.start_time.isoformat() if self.start_time else None,
             'end_time': self.end_time.isoformat() if self.end_time else None,
-            'is_active': self.is_active
+            'deadline': self.deadline.isoformat() if self.deadline else None,
+            'assignment_type': self.assignment_type,
+            'lock_after_deadline': self.lock_after_deadline,
+            'is_active': self.is_active,
+            'is_locked': self.is_locked() if hasattr(self, 'is_locked') else False
         }
+    
+    def is_locked(self):
+        """Check if quiz is locked based on deadline"""
+        if not self.lock_after_deadline or not self.deadline:
+            return False
+        from datetime import datetime
+        return datetime.utcnow() > self.deadline
 
 class QuizQuestion(db.Model):
     """Many-to-many relationship between Quiz and Question"""
@@ -224,6 +421,26 @@ class QuizQuestion(db.Model):
             'question': self.question.to_dict() if self.question else None,
             'marks': self.marks,
             'order': self.order
+        }
+
+class QuizAssignment(db.Model):
+    """Quiz assignment model to track which students are assigned to a quiz"""
+    __tablename__ = 'quiz_assignments'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    quiz_id = db.Column(db.Integer, db.ForeignKey('quizzes.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    assigned_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = db.relationship('User', backref='quiz_assignments', lazy=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'quiz_id': self.quiz_id,
+            'user_id': self.user_id,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None
         }
 
 class QuizAttempt(db.Model):
@@ -282,6 +499,10 @@ class InterviewSession(db.Model):
     
     # Detailed scoring breakdown (JSON)
     score_breakdown = db.Column(db.Text)  # JSON with component scores
+    
+    # Selfie Face Verification
+    selfie_embedding = db.Column(db.Text)  # Base64 encoded selfie face embedding
+    selfie_registered_at = db.Column(db.DateTime)  # When selfie was registered
     
     # Timestamps
     started_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -480,7 +701,7 @@ class Resource(db.Model):
     type = db.Column(db.String(20), nullable=False)  # 'pdf', 'code_snippet', 'flashcard', 'notes'
     file_path = db.Column(db.String(255))
     content = db.Column(db.Text)  # For flashcards, code snippets, notes
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'))
     tags = db.Column(db.String(200))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -537,9 +758,12 @@ class Post(db.Model):
     file_path = db.Column(db.String(500))  # Path to uploaded file (PDF, JPG, PNG)
     file_type = db.Column(db.String(20))  # 'pdf', 'jpg', 'png'
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     post_type = db.Column(db.String(50), default='experience')  # 'experience', 'tip', 'question', 'discussion'
     tags = db.Column(db.String(200))  # Comma-separated tags
+    # New fields for MCQ and coding questions
+    mcq_questions = db.Column(db.Text)  # JSON string of MCQ questions array
+    coding_questions = db.Column(db.Text)  # JSON string of coding questions array
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
@@ -549,6 +773,7 @@ class Post(db.Model):
     user = db.relationship('User', backref='posts')
     
     def to_dict(self):
+        import json
         return {
             'id': self.id,
             'title': self.title,
@@ -559,6 +784,8 @@ class Post(db.Model):
             'user_id': self.user_id,
             'post_type': self.post_type,
             'tags': self.tags,
+            'mcq_questions': json.loads(self.mcq_questions) if self.mcq_questions else [],
+            'coding_questions': json.loads(self.coding_questions) if self.coding_questions else [],
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'is_active': self.is_active,
@@ -581,11 +808,18 @@ class Leaderboard(db.Model):
     rank = db.Column(db.Integer)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+    # Relationship
+    user = db.relationship('User', backref='leaderboard_entry')
+    
     def to_dict(self):
+        user = self.user
         return {
             'id': self.id,
             'user_id': self.user_id,
-            'username': self.user.username if self.user else None,
+            'username': user.username if user else None,
+            'full_name': user.full_name or (f"{user.first_name} {user.last_name}" if user and user.first_name and user.last_name else None) if user else None,
+            'reg_no': user.reg_no if user else None,
+            'college_email': user.college_email if user else None,
             'total_score': self.total_score,
             'quiz_score': self.quiz_score,
             'coding_score': self.coding_score,
@@ -594,5 +828,113 @@ class Leaderboard(db.Model):
             'total_quizzes': self.total_quizzes,
             'rank': self.rank,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class ChatHistory(db.Model):
+    """Simple chat history for AI chatbot"""
+    __tablename__ = 'chat_history'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    role = db.Column(db.String(10), nullable=False)  # 'user' or 'assistant'
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'role': self.role,
+            'message': self.message,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class UsageStats(db.Model):
+    """Track OpenAI API usage and costs"""
+    __tablename__ = 'usage_stats'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    model = db.Column(db.String(50), nullable=False)  # e.g., 'gpt-3.5-turbo'
+    prompt_tokens = db.Column(db.Integer, nullable=False, default=0)
+    completion_tokens = db.Column(db.Integer, nullable=False, default=0)
+    total_tokens = db.Column(db.Integer, nullable=False, default=0)
+    cost_usd = db.Column(db.Numeric(10, 6), nullable=False, default=0.0)  # Cost in USD
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'model': self.model,
+            'prompt_tokens': self.prompt_tokens,
+            'completion_tokens': self.completion_tokens,
+            'total_tokens': self.total_tokens,
+            'cost_usd': float(self.cost_usd) if self.cost_usd else 0.0,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+class Batch(db.Model):
+    """Batch model for organizing students into batches"""
+    __tablename__ = 'batches'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True, index=True)
+    description = db.Column(db.Text)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+    
+    # Relationships
+    students = db.relationship('User', backref='batch', lazy=True, foreign_keys='User.batch_id')
+    created_by_user = db.relationship('User', backref='created_batches', lazy=True, foreign_keys=[created_by])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_user.full_name if self.created_by_user else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'is_active': self.is_active,
+            'student_count': len([s for s in self.students if s.role == 'student' and s.is_active]) if self.students else 0
+        }
+
+class ActivityLog(db.Model):
+    """Activity log model for tracking all test activities and submissions"""
+    __tablename__ = 'activity_logs'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    activity_type = db.Column(db.String(50), nullable=False, index=True)  # 'test_created', 'test_attempted', 'test_submitted', 'evaluation', 'comment'
+    entity_type = db.Column(db.String(50), nullable=False)  # 'quiz', 'coding_test', 'mcq', 'fill_blank'
+    entity_id = db.Column(db.Integer, nullable=False, index=True)  # ID of quiz/question/test
+    entity_name = db.Column(db.String(200))  # Name/title for quick reference
+    description = db.Column(db.Text)  # Detailed description of activity
+    metadata_json = db.Column(db.Text)  # JSON string for additional data (renamed from metadata to avoid SQLAlchemy conflict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        metadata_dict = {}
+        if self.metadata_json:
+            try:
+                metadata_dict = json.loads(self.metadata_json)
+            except:
+                metadata_dict = {}
+        
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.full_name if self.user else None,
+            'username': self.user.username if self.user else None,
+            'activity_type': self.activity_type,
+            'entity_type': self.entity_type,
+            'entity_id': self.entity_id,
+            'entity_name': self.entity_name,
+            'description': self.description,
+            'metadata': metadata_dict,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
 

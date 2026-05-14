@@ -299,20 +299,56 @@ def process_job_description(jd_text: str, resume_skills: List[str] = None) -> Di
     if resume_skills:
         matching_skills, missing_skills = map_resume_jd_skills(resume_skills, jd_skills)
     
-    # Extract job title
+    # Extract job title - look for actual job titles, not descriptions
     job_title = None
-    title_patterns = [
-        r'position[:\s]+(.+?)(?:\n|\.)',
-        r'role[:\s]+(.+?)(?:\n|\.)',
-        r'title[:\s]+(.+?)(?:\n|\.)',
-        r'job[:\s]+(.+?)(?:\n|\.)'
-    ]
     
-    for pattern in title_patterns:
-        match = re.search(pattern, jd_text, re.IGNORECASE)
-        if match:
-            job_title = match.group(1).strip()
-            break
+    # First, try to find job title at the beginning (usually first line or first 200 chars)
+    first_lines = jd_text[:300].split('\n')
+    for line in first_lines[:5]:  # Check first 5 lines
+        line = line.strip()
+        # Skip lines that are clearly descriptions
+        if any(keyword in line.lower() for keyword in ['description', 'responsibilities', 'requirements', 'qualifications']):
+            continue
+        # Look for job title patterns (usually 2-6 words, title case)
+        if 2 <= len(line.split()) <= 6 and line[0].isupper():
+            # Check if it looks like a job title (contains common job title words)
+            job_keywords = ['engineer', 'developer', 'manager', 'analyst', 'specialist', 'consultant', 
+                          'architect', 'lead', 'director', 'coordinator', 'assistant', 'agent', 
+                          'representative', 'executive', 'officer', 'administrator']
+            if any(keyword in line.lower() for keyword in job_keywords):
+                job_title = line
+                break
+    
+    # Fallback: Use regex patterns but limit length
+    if not job_title:
+        title_patterns = [
+            r'^(?:job\s+)?title[:\s]+(.+?)(?:\n|$)',
+            r'^(?:position|role)[:\s]+(.+?)(?:\n|$)',
+            r'^([A-Z][a-zA-Z\s]+(?:Engineer|Developer|Manager|Analyst|Architect|Lead|Specialist|Consultant|Agent|Representative))',
+        ]
+        
+        for pattern in title_patterns:
+            match = re.search(pattern, jd_text[:500], re.IGNORECASE | re.MULTILINE)
+            if match:
+                job_title = match.group(1).strip()
+                # Limit to first line or 100 chars
+                job_title = job_title.split('\n')[0].strip()
+                if len(job_title) > 100:
+                    job_title = job_title[:100]
+                break
+    
+    # Clean and truncate to 200 characters (database limit)
+    if job_title:
+        # Remove common prefixes/suffixes that might have been captured
+        job_title = re.sub(r'^(description|role|position|job)[:\s]+', '', job_title, flags=re.IGNORECASE)
+        job_title = job_title.strip()
+        # Split by common separators and take first part (usually the actual title)
+        if ':' in job_title:
+            job_title = job_title.split(':')[0].strip()
+        if ' - ' in job_title:
+            job_title = job_title.split(' - ')[0].strip()
+        # Limit to 200 characters
+        job_title = job_title[:200].strip()
     
     # Extract experience requirement
     exp_patterns = [

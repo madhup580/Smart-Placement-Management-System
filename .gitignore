@@ -4,25 +4,17 @@ __pycache__/
 *$py.class
 *.so
 .Python
-venv/
-env/
-ENV/
 *.egg-info/
 dist/
 build/
+*.egg
 
-# Flask
-instance/
-.webassets-cache
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-
-# Environment variables
+# Environment
 .env
-.env.local
+.venv
+env/
+venv/
+ENV/
 
 # IDE
 .vscode/
@@ -31,16 +23,26 @@ instance/
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Uploads
-backend/uploads/
-*.pdf
-*.doc
-*.docx
+# Database
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs
 *.log
 
+# Instance folder (Flask)
+instance/
+
+# Uploads (keep structure but ignore files)
+uploads/*
+!uploads/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.cache

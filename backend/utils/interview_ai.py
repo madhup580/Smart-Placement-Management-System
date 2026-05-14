@@ -12,6 +12,8 @@ from utils.resume_processor import (
     extract_projects,
     extract_certificates
 )
+from utils.openai_client import get_openai_client, OpenAIError
+from utils.async_utils import run_in_background, cache_result
 
 def calculate_total_questions(interview_type, resume_data=None, jd_data=None, experience_level='fresher'):
     """
@@ -84,25 +86,37 @@ def calculate_total_questions(interview_type, resume_data=None, jd_data=None, ex
 
 def get_system_prompt(interview_type='TR', experience_level='fresher', resume_text='', job_description='', resume_data=None, jd_data=None):
     """
-    Generate system prompt for AI interviewer based on interview type (TR or HR)
+    Generate system prompt for AI interviewer - Professional Human Interviewer
     """
+    languages = resume_data.get('programming_languages', []) if resume_data else extract_programming_languages(resume_text)
+    languages_str = ', '.join(languages[:5]) if languages else 'General programming'
+    
+    jd_skills = jd_data.get('required_skills', [])[:5] if jd_data else []
+    jd_skills_str = ', '.join(jd_skills) if jd_skills else 'General skills'
+    
     if interview_type == 'TR':
-        # Technical Interview system prompt
-        languages = resume_data.get('programming_languages', []) if resume_data else extract_programming_languages(resume_text)
-        languages_str = ', '.join(languages[:5]) if languages else 'General programming'
-        
-        jd_skills = jd_data.get('required_skills', [])[:5] if jd_data else []
-        jd_skills_str = ', '.join(jd_skills) if jd_skills else 'General skills'
-        
-        return f"""You are a professional technical interviewer conducting a mock interview.
+        return f"""You are a professional human technical interviewer conducting a REAL interview.
 
-RULES (STRICTLY FOLLOW):
-1. Ask ONE question at a time
-2. Do NOT explain answers or provide hints
-3. Adjust difficulty based on candidate responses
-4. Evaluate answers for technical correctness, clarity, and confidence
-5. Be concise and realistic - conduct a real interview, not a tutorial
-6. Do NOT repeat questions already asked
+You are NOT a chatbot. You are a real interviewer.
+
+CRITICAL RULES:
+1. Behave like a REAL human interviewer - natural, conversational, professional
+2. Ask ONLY ONE question at a time
+3. NEVER repeat the same question
+4. Questions must feel natural and conversational
+5. Use full interview context: Resume, Job Description, Previous Q&A, Previous mistakes, Previous strengths
+6. Adapt question difficulty dynamically based on candidate performance:
+   - Strong answer (score ≥7) → Ask HARDER question (Hard difficulty)
+   - Medium answer (score 4-6) → Continue SAME level (Medium difficulty)
+   - Weak answer (score <4) → Ask SIMPLER question (Easy difficulty)
+7. Ask follow-up questions if:
+   - Answer is incomplete
+   - Answer is vague
+   - Answer is partially correct
+   - Example is missing
+   - Explanation is missing
+   - Time/space complexity missing (for technical questions)
+   - Practical usage missing
 
 INTERVIEW CONTEXT:
 - Interview Type: TECHNICAL INTERVIEW (TR)
@@ -110,37 +124,53 @@ INTERVIEW CONTEXT:
 - Candidate Skills (from resume): {languages_str}
 - Job Requirements: {jd_skills_str}
 
-INTERVIEW FLOW (STRICT ORDER):
-1. Introduction question (always first)
-2. Resume-based technical questions (projects, technologies, certificates)
-3. Programming languages questions (core concepts, practical questions)
-4. JD-required technical skills (especially missing/weak skills)
-5. Scenario-based problem-solving questions
+EVALUATION CRITERIA (Rate 0-10 for each):
+1. Correctness: Technical accuracy and correctness
+2. Clarity: How clear, well-structured, and understandable
+3. Depth: Technical depth, detail level, completeness
+4. Confidence: How confident and articulate the candidate sounds
+
+CONTRADICTION DETECTION:
+- Compare current answer with previous answers
+- If contradiction found: Reduce confidence score and mention gently in feedback
 
 Be professional, realistic, and assess the candidate's actual technical knowledge."""
     
     else:  # HR Interview
-        return f"""You are a professional HR interviewer conducting a mock interview.
+        return f"""You are a professional human HR interviewer conducting a REAL interview.
 
-RULES (STRICTLY FOLLOW):
-1. Ask ONE question at a time
-2. Do NOT explain answers or provide hints
-3. Focus on communication skills, confidence, and behavioral aspects
-4. Evaluate answers for clarity, structure, confidence, and appropriateness
-5. Be friendly but professional
-6. Do NOT ask deep technical questions (this is an HR interview)
+You are NOT a chatbot. You are a real interviewer.
+
+CRITICAL RULES:
+1. Behave like a REAL human interviewer - natural, conversational, professional
+2. Ask ONLY ONE question at a time
+3. NEVER repeat the same question
+4. Questions must feel natural and conversational
+5. Use full interview context: Resume, Job Description, Previous Q&A, Previous mistakes, Previous strengths
+6. Adapt question difficulty dynamically based on candidate performance:
+   - Strong answer (score ≥7) → Ask HARDER question (Hard difficulty)
+   - Medium answer (score 4-6) → Continue SAME level (Medium difficulty)
+   - Weak answer (score <4) → Ask SIMPLER question (Easy difficulty)
+7. Ask follow-up questions if:
+   - Answer is incomplete
+   - Answer is vague
+   - Answer lacks examples
+   - Answer lacks structure (STAR method needed)
+   - Answer doesn't connect to experience
 
 INTERVIEW CONTEXT:
 - Interview Type: HR INTERVIEW
 - Experience Level: {experience_level}
 
-INTERVIEW FOCUS:
-1. Introduction question (always first)
-2. Communication skills assessment
-3. Behavioral questions (strengths, weaknesses, teamwork)
-4. Situational/real-life scenarios
-5. Career goals and motivation
-6. Confidence and clarity evaluation
+EVALUATION CRITERIA (Rate 0-10 for each):
+1. Correctness: Appropriateness and relevance (not technical correctness)
+2. Clarity: Communication clarity, structure, articulation
+3. Depth: Detail level, completeness, examples provided
+4. Confidence: Confidence level, professional tone, self-assurance
+
+CONTRADICTION DETECTION:
+- Compare current answer with previous answers
+- If contradiction found: Reduce confidence score and mention gently in feedback
 
 Focus on evaluating communication skills, confidence, clarity, and behavioral fit.
 Do NOT ask technical questions."""
@@ -180,7 +210,8 @@ def determine_phase_hr(question_number: int) -> str:
 def generate_interview_question(interview_type='TR', resume_text='', job_description='',
                                 phase='introduction', question_number=0, conversation_history=[],
                                 experience_level='fresher', previous_answer_score=None,
-                                resume_data=None, jd_data=None):
+                                resume_data=None, jd_data=None, difficulty_level='Medium',
+                                is_follow_up=False, follow_up_reason=''):
     """
     Generate interview question based on interview type (TR or HR) and phase
     FIRST QUESTION must always be "Introduce yourself"
@@ -195,26 +226,62 @@ def generate_interview_question(interview_type='TR', resume_text='', job_descrip
     # Use AI to generate questions if API key available
     if Config.AI_API_KEY:
         try:
+            # Build comprehensive history context
             history_context = ""
+            asked_questions = []
+            previous_qa_pairs = []
+            
             if conversation_history:
-                recent_qa = [msg for msg in conversation_history[-6:] if msg.get('type') in ['question', 'answer']]
+                # Extract all asked questions to avoid repetition
+                for msg in conversation_history:
+                    if msg.get('type') == 'question':
+                        asked_questions.append(msg.get('content', ''))
+                
+                # Get recent Q&A pairs for context
+                recent_qa = [msg for msg in conversation_history[-10:] if msg.get('type') in ['question', 'answer', 'evaluation']]
                 if recent_qa:
-                    history_context = "\n\nPrevious Q&A:\n"
+                    history_context = "\n\nPrevious Q&A Context:\n"
+                    current_q = None
                     for msg in recent_qa:
                         if msg['type'] == 'question':
-                            history_context += f"Q: {msg['content']}\n"
-                        else:
-                            history_context += f"A: {msg['content'][:150]}...\n"
+                            current_q = msg.get('content', '')
+                            history_context += f"Q: {current_q}\n"
+                        elif msg['type'] == 'answer':
+                            history_context += f"A: {msg.get('content', '')[:200]}...\n"
+                        elif msg['type'] == 'evaluation':
+                            score = msg.get('overall_score', 0)
+                            history_context += f"Evaluation: Score {score}/10\n"
+                
+                # Add list of asked questions to avoid repetition
+                if asked_questions:
+                    history_context += f"\n\nIMPORTANT - DO NOT REPEAT THESE QUESTIONS:\n"
+                    for i, q in enumerate(asked_questions[-10:], 1):  # Last 10 questions
+                        history_context += f"{i}. {q[:100]}...\n"
             
-            # Determine difficulty based on previous answer
-            difficulty_hint = ""
-            if previous_answer_score is not None:
-                if previous_answer_score >= 7:
-                    difficulty_hint = "Ask a more challenging question (candidate answered well)."
-                elif previous_answer_score >= 4:
-                    difficulty_hint = "Ask a medium difficulty question."
+            # Use provided difficulty_level or determine from previous answer
+            if difficulty_level not in ['Easy', 'Medium', 'Hard']:
+                if previous_answer_score is not None:
+                    if previous_answer_score >= 7:
+                        difficulty_level = "Hard"
+                    elif previous_answer_score >= 4:
+                        difficulty_level = "Medium"
+                    else:
+                        difficulty_level = "Easy"
                 else:
-                    difficulty_hint = "Ask a simpler or clarification question (candidate struggled)."
+                    difficulty_level = "Medium"
+            
+            # Build difficulty hint
+            if difficulty_level == "Hard":
+                difficulty_hint = f"Ask a MORE CHALLENGING question (Hard difficulty). Increase technical depth, ask for examples, time/space complexity, or practical applications."
+            elif difficulty_level == "Easy":
+                difficulty_hint = f"Ask a SIMPLER question (Easy difficulty). Simplify the question, ask for basic concepts, or provide clarification."
+            else:
+                difficulty_hint = f"Ask a MEDIUM difficulty question. Maintain appropriate technical depth."
+            
+            # Add follow-up context if this is a follow-up question
+            follow_up_context = ""
+            if is_follow_up and follow_up_reason:
+                follow_up_context = f"\n\nIMPORTANT: This is a FOLLOW-UP question because: {follow_up_reason}\nAsk a question that addresses: {follow_up_reason}\nDo NOT repeat the previous question. Ask a related follow-up that helps clarify or expand on the answer."
             
             prompt = ""
             
@@ -222,53 +289,53 @@ def generate_interview_question(interview_type='TR', resume_text='', job_descrip
                 # Technical Interview questions
                 prompt = generate_tr_question_prompt(phase, resume_text, job_description, 
                                                     resume_data, jd_data, difficulty_hint, 
-                                                    experience_level)
+                                                    experience_level, is_follow_up, follow_up_reason)
             else:
                 # HR Interview questions
-                prompt = generate_hr_question_prompt(phase, resume_text, difficulty_hint, experience_level)
+                prompt = generate_hr_question_prompt(phase, resume_text, difficulty_hint, 
+                                                   experience_level, is_follow_up, follow_up_reason)
             
-            headers = {
-                'Authorization': f'Bearer {Config.AI_API_KEY}',
-                'Content-Type': 'application/json'
-            }
+            # Use OpenAI client with retry logic
+            client = get_openai_client()
+            messages = [
+                {'role': 'system', 'content': get_system_prompt(interview_type, experience_level, resume_text, job_description, resume_data, jd_data)},
+                {'role': 'user', 'content': prompt + history_context + follow_up_context}
+            ]
             
-            payload = {
-                'model': 'gpt-3.5-turbo',
-                'messages': [
-                    {'role': 'system', 'content': get_system_prompt(interview_type, experience_level, resume_text, job_description, resume_data, jd_data)},
-                    {'role': 'user', 'content': prompt + history_context}
-                ],
-                'max_tokens': 200,
-                'temperature': 0.7
-            }
+            question = client.chat_completion(
+                messages=messages,
+                max_tokens=200,
+                temperature=0.7,
+                timeout=15
+            )
             
-            response = requests.post(Config.AI_API_URL, headers=headers, json=payload, timeout=15)
-            response.raise_for_status()
-            data = response.json()
+            # Clean up formatting
+            question = re.sub(r'^["\']|["\']$', '', question)
+            question = re.sub(r'^(Question:|Q:)\s*', '', question, flags=re.IGNORECASE)
+            return question.strip()
             
-            if 'choices' in data and len(data['choices']) > 0:
-                question = data['choices'][0]['message']['content'].strip()
-                # Clean up formatting
-                question = re.sub(r'^["\']|["\']$', '', question)
-                question = re.sub(r'^(Question:|Q:)\s*', '', question, flags=re.IGNORECASE)
-                return question.strip()
+        except OpenAIError as e:
+            print(f"[Interview AI] OpenAI API error: {e}")
         except Exception as e:
-            print(f"AI API error: {e}")
+            print(f"[Interview AI] Unexpected error: {e}")
     
     # Fallback questions
     return get_fallback_question(interview_type, phase, resume_data, jd_data)
 
-def generate_tr_question_prompt(phase, resume_text, job_description, resume_data, jd_data, difficulty_hint, experience_level):
+def generate_tr_question_prompt(phase, resume_text, job_description, resume_data, jd_data, difficulty_hint, experience_level, is_follow_up=False, follow_up_reason=''):
     """Generate prompt for Technical Interview question"""
     if phase == 'resume':
         projects = resume_data.get('projects', [])[:3] if resume_data else []
         projects_str = ', '.join([p.get('name', '') for p in projects]) if projects else 'projects mentioned in resume'
         
+        follow_up_note = f"\n\nFOLLOW-UP CONTEXT: {follow_up_reason}" if is_follow_up else ""
+        
         return f"""Generate a TECHNICAL interview question based on the candidate's resume.
 
 Resume Summary: {resume_text[:800] if resume_text else 'Not provided'}
 Projects: {projects_str}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE specific technical question about:
 - A project mentioned in the resume
@@ -281,6 +348,8 @@ Question should be:
 - Appropriate for {experience_level} level
 - {difficulty_hint}
 - Tests actual technical knowledge
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
 
 Return ONLY the question, no additional text."""
     
@@ -288,10 +357,13 @@ Return ONLY the question, no additional text."""
         languages = resume_data.get('programming_languages', [])[:3] if resume_data else []
         languages_str = ', '.join(languages) if languages else 'programming'
         
+        follow_up_note = f"\n\nFOLLOW-UP CONTEXT: {follow_up_reason}" if is_follow_up else ""
+        
         return f"""Generate a TECHNICAL interview question about programming languages.
 
 Candidate's Programming Languages: {languages_str}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE technical question about:
 - Core concepts of a programming language mentioned
@@ -303,6 +375,8 @@ Question should:
 - Test deep understanding
 - Be appropriate for {experience_level} level
 - {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
 
 Return ONLY the question, no additional text."""
     
@@ -310,11 +384,14 @@ Return ONLY the question, no additional text."""
         missing_skills = jd_data.get('missing_skills', [])[:5] if jd_data else []
         missing_skills_str = ', '.join(missing_skills) if missing_skills else 'required skills'
         
+        follow_up_note = f"\n\nFOLLOW-UP CONTEXT: {follow_up_reason}" if is_follow_up else ""
+        
         return f"""Generate a TECHNICAL interview question about job-required skills, especially missing/weak skills.
 
 Job Description: {job_description[:800] if job_description else 'Not provided'}
 Missing/Weak Skills (HIGH PRIORITY): {missing_skills_str}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE technical question about:
 - Skills required in the job description
@@ -326,15 +403,20 @@ Question should:
 - Test ability to learn/adapt
 - Be appropriate for {experience_level} level
 - {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
 
 Return ONLY the question, no additional text."""
     
     else:  # scenario
+        follow_up_note = f"\n\nFOLLOW-UP CONTEXT: {follow_up_reason}" if is_follow_up else ""
+        
         return f"""Generate a TECHNICAL scenario-based problem-solving question.
 
 Resume: {resume_text[:500] if resume_text else 'Not provided'}
 Job Description: {job_description[:500] if job_description else 'Not provided'}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE real-world problem-solving question that:
 - Presents a technical scenario
@@ -342,30 +424,41 @@ Generate ONE real-world problem-solving question that:
 - Tests practical application of knowledge
 - Is appropriate for {experience_level} level
 - {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
 
 Return ONLY the question, no additional text."""
 
-def generate_hr_question_prompt(phase, resume_text, difficulty_hint, experience_level):
+def generate_hr_question_prompt(phase, resume_text, difficulty_hint, experience_level, is_follow_up=False, follow_up_reason=''):
     """Generate prompt for HR Interview question"""
+    follow_up_note = f"\n\nFOLLOW-UP CONTEXT: {follow_up_reason}" if is_follow_up else ""
+    
     if phase == 'communication':
         return f"""Generate an HR interview question to assess COMMUNICATION SKILLS.
 
 Resume: {resume_text[:500] if resume_text else 'Not provided'}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE question that tests:
 - Communication clarity
 - Articulation ability
 - Professional expression
 
-Question should be appropriate for {experience_level} level.
+Question should:
+- Be appropriate for {experience_level} level
+- {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
+
 Return ONLY the question, no additional text."""
     
     elif phase == 'behavioral':
         return f"""Generate a BEHAVIORAL interview question.
 
 Resume: {resume_text[:500] if resume_text else 'Not provided'}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE behavioral question about:
 - Strengths & weaknesses
@@ -373,13 +466,20 @@ Generate ONE behavioral question about:
 - Conflict handling
 - Past experiences
 
-Use STAR method context (Situation, Task, Action, Result).
+Question should:
+- Use STAR method context (Situation, Task, Action, Result)
+- Be appropriate for {experience_level} level
+- {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
+
 Return ONLY the question, no additional text."""
     
     elif phase == 'situational':
         return f"""Generate a SITUATIONAL/REAL-LIFE SCENARIO question.
 
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE situational question that:
 - Presents a work scenario
@@ -387,19 +487,30 @@ Generate ONE situational question that:
 - Evaluates decision-making
 - Assesses professional judgment
 
+Question should:
+- {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
+
 Return ONLY the question, no additional text."""
     
     else:  # career
         return f"""Generate a CAREER GOALS AND MOTIVATION question.
 
 Resume: {resume_text[:500] if resume_text else 'Not provided'}
-{difficulty_hint}
+Difficulty Level: {difficulty_hint}
+{follow_up_note}
 
 Generate ONE question about:
 - Career goals
 - Motivation
 - Future aspirations
 - Why they want this role
+
+Question should:
+- {difficulty_hint}
+- Natural and conversational (like a real interviewer)
+- NEVER repeat a question already asked
 
 Return ONLY the question, no additional text."""
 
@@ -410,6 +521,11 @@ def get_fallback_question(interview_type, phase, resume_data=None, jd_data=None)
         lang = languages[0] if languages else 'Python'
         
         fallback_tr = {
+            'introduction': [
+                "Please introduce yourself and tell us about your technical background, including your programming experience and any projects you've worked on.",
+                "Tell us about yourself, your technical skills, and what interests you in software development.",
+                "Can you give us a brief introduction about yourself, focusing on your technical background and programming experience?"
+            ],
             'resume': [
                 f"Tell me about a project mentioned in your resume and the technologies you used.",
                 f"Can you explain a technical challenge you faced in one of your projects?",
@@ -432,10 +548,15 @@ def get_fallback_question(interview_type, phase, resume_data=None, jd_data=None)
             ]
         }
         import random
-        return random.choice(fallback_tr.get(phase, fallback_tr['scenario']))
+        return random.choice(fallback_tr.get(phase, fallback_tr['introduction']))
     
     else:  # HR
         fallback_hr = {
+            'introduction': [
+                "Please introduce yourself and tell us about your background, your career goals, and why you're interested in this role.",
+                "Tell us about yourself, your professional journey, and what brings you here today.",
+                "Can you give us a brief introduction about yourself, including your background and what interests you about this opportunity?"
+            ],
             'communication': [
                 "How do you communicate technical concepts to non-technical stakeholders?",
                 "Describe a time when you had to explain a complex idea clearly.",
@@ -458,33 +579,53 @@ def get_fallback_question(interview_type, phase, resume_data=None, jd_data=None)
             ]
         }
         import random
-        return random.choice(fallback_hr.get(phase, fallback_hr['career']))
+        return random.choice(fallback_hr.get(phase, fallback_hr['introduction']))
 
 def evaluate_answer(question, answer, interview_type='TR', phase='introduction', 
-                   resume_text='', job_description=''):
+                   resume_text='', job_description='', conversation_history=None, 
+                   resume_data=None, jd_data=None):
     """
     Evaluate answer with scoring (0-10 scale for each metric)
-    For TR: Focus on correctness, clarity, confidence
-    For HR: Focus on communication, clarity, confidence, structure
+    Professional human interviewer evaluation with contradiction detection
+    
     Returns: {
         'feedback': str,
         'correctness': float (0-10),
         'clarity': float (0-10),
+        'depth': float (0-10),  # Technical depth
         'confidence': float (0-10),
-        'overall_score': float (0-10) - weighted average
+        'overall_score': float (0-10) - weighted average,
+        'contradiction_detected': bool,
+        'difficulty_level': str,  # "Easy", "Medium", "Hard"
+        'follow_up_needed': bool,
+        'follow_up_reason': str
     }
     """
     if Config.AI_API_KEY:
         try:
+            # Build conversation history context for contradiction detection
+            history_context = ""
+            previous_answers = []
+            if conversation_history:
+                for msg in conversation_history:
+                    if msg.get('type') == 'answer':
+                        previous_answers.append(msg.get('content', ''))
+                if previous_answers:
+                    history_context = "\n\nPrevious Answers (for contradiction detection):\n"
+                    for i, prev_ans in enumerate(previous_answers[-5:], 1):  # Last 5 answers
+                        history_context += f"Previous Answer {i}: {prev_ans[:200]}...\n"
+            
             # Different evaluation criteria for TR vs HR
             if interview_type == 'TR':
                 eval_criteria = """1. Correctness (0-10): Technical accuracy and correctness of the answer
 2. Clarity (0-10): How clear, well-structured, and understandable is the answer
-3. Confidence (0-10): How confident and articulate does the candidate sound"""
+3. Depth (0-10): Technical depth, detail level, completeness (examples, time/space complexity, practical usage)
+4. Confidence (0-10): How confident and articulate does the candidate sound"""
             else:  # HR
                 eval_criteria = """1. Correctness (0-10): Appropriateness and relevance of the answer (not technical correctness)
 2. Clarity (0-10): Communication clarity, structure, and articulation
-3. Confidence (0-10): Confidence level, professional tone, and self-assurance"""
+3. Depth (0-10): Detail level, completeness, examples provided, STAR method usage
+4. Confidence (0-10): Confidence level, professional tone, and self-assurance"""
             
             # Determine if this is a behavioral/situational question that would benefit from STAR method
             is_behavioral = any(keyword in question.lower() for keyword in [
@@ -568,86 +709,157 @@ Example feedback format:
 For example, instead of saying 'I worked on a project', say 'I led a team of 5 developers to build a mobile app that increased user engagement by 30%'"
 """
             
-            prompt = f"""Evaluate this interview answer and provide scores.
+            # Determine if follow-up is needed
+            answer_lower = answer.lower()
+            answer_length = len(answer.split())
+            is_incomplete = answer_length < 30 or len(answer.split('.')) < 2
+            is_vague = any(word in answer_lower for word in ['maybe', 'probably', 'i think', 'not sure', 'kind of'])
+            lacks_example = not any(word in answer_lower for word in ['example', 'for instance', 'such as', 'like', 'e.g.'])
+            lacks_explanation = not any(word in answer_lower for word in ['because', 'since', 'due to', 'reason', 'why'])
+            
+            follow_up_needed = is_incomplete or is_vague or (interview_type == 'TR' and lacks_example)
+            follow_up_reason = ""
+            if is_incomplete:
+                follow_up_reason = "Answer is incomplete"
+            elif is_vague:
+                follow_up_reason = "Answer is vague"
+            elif lacks_example:
+                follow_up_reason = "Example is missing"
+            elif lacks_explanation:
+                follow_up_reason = "Explanation is missing"
+            
+            prompt = f"""You are a professional human {interview_type} interviewer evaluating a candidate's answer.
 
 Interview Type: {interview_type} Interview
 Question: {question}
 Candidate's Answer: {answer}
 Phase: {phase}
-Resume Context: {resume_text[:300] if resume_text else 'Not provided'}
+Resume Context: {resume_text[:500] if resume_text else 'Not provided'}
+Job Description Context: {job_description[:500] if job_description else 'Not provided'}
+{history_context}
 
-Evaluate and provide:
+CRITICAL TASKS:
+1. Evaluate the answer on these 4 criteria (0-10 each):
 {eval_criteria}
 
-{feedback_guidance}
+2. Detect CONTRADICTIONS:
+   - Compare current answer with previous answers
+   - Look for conflicting statements, inconsistent information
+   - If contradiction found: Set "contradiction_detected": true and reduce confidence score
+   - Mention contradiction GENTLY in feedback (e.g., "I notice a slight inconsistency...")
 
-Then provide constructive feedback that:
-- Acknowledges what was done well (if anything)
-- Explains SPECIFICALLY HOW to improve (not just "improve communication")
-- Provides structured guidance with examples
-- Is encouraging and professional
-- If structure is lacking, include specific frameworks (STAR method, etc.) with examples
+3. Determine DIFFICULTY LEVEL for next question:
+   - Calculate average of correctness, clarity, depth, confidence
+   - If average ≥ 7: "Hard" (candidate is strong)
+   - If average 4-6: "Medium" (candidate is medium)
+   - If average < 4: "Easy" (candidate is weak)
+
+4. Determine if FOLLOW-UP is needed:
+   - Answer incomplete? → follow_up_needed: true
+   - Answer vague? → follow_up_needed: true
+   - Example missing? → follow_up_needed: true
+   - Explanation missing? → follow_up_needed: true
+   - Time/space complexity missing (for technical)? → follow_up_needed: true
+
+5. Provide constructive feedback:
+   - Acknowledge what was done well (if anything)
+   - Explain SPECIFICALLY HOW to improve
+   - Be encouraging and professional
+   - If contradiction detected, mention it gently
 
 Return your response in this EXACT JSON format:
 {{
-    "correctness": <number 0-10>,
-    "clarity": <number 0-10>,
-    "confidence": <number 0-10>,
-    "feedback": "<your detailed feedback with specific HOW-TO guidance>"
+    "evaluation": {{
+        "correctness": <number 0-10>,
+        "clarity": <number 0-10>,
+        "depth": <number 0-10>,
+        "confidence": <number 0-10>,
+        "remarks": "<short professional feedback>"
+    }},
+    "contradiction_detected": <true/false>,
+    "difficulty_level": "<Easy/Medium/Hard>",
+    "follow_up_needed": <true/false>,
+    "follow_up_reason": "<reason if follow_up_needed is true, else empty string>"
 }}"""
             
-            headers = {
-                'Authorization': f'Bearer {Config.AI_API_KEY}',
-                'Content-Type': 'application/json'
+            # Use OpenAI client with retry logic
+            client = get_openai_client()
+            messages = [
+                {'role': 'system', 'content': f'You are an experienced {interview_type} interview evaluator. Provide accurate scores and constructive feedback in JSON format.'},
+                {'role': 'user', 'content': prompt}
+            ]
+            
+            content = client.chat_completion(
+                messages=messages,
+                max_tokens=500,
+                temperature=0.5,
+                timeout=20
+            )
+            
+            # Parse JSON from response
+            try:
+                json_match = re.search(r'\{.*?"evaluation".*?\}', content, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group())
+                else:
+                    data = json.loads(content)
+            except json.JSONDecodeError:
+                # Try to extract JSON from markdown code blocks
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group(1))
+                else:
+                    raise ValueError("Could not parse JSON from response")
+            
+            # Data is already parsed from chat_completion
+            eval_data = data
+            
+            # Extract evaluation scores
+            evaluation = eval_data.get('evaluation', {})
+            correctness = float(evaluation.get('correctness', eval_data.get('correctness', 5)))
+            clarity = float(evaluation.get('clarity', eval_data.get('clarity', 5)))
+            depth = float(evaluation.get('depth', eval_data.get('depth', 5)))
+            confidence = float(evaluation.get('confidence', eval_data.get('confidence', 5)))
+            remarks = evaluation.get('remarks', eval_data.get('feedback', 'Thank you for your answer.'))
+            
+            # Contradiction detection
+            contradiction_detected = bool(eval_data.get('contradiction_detected', False))
+            if contradiction_detected:
+                # Reduce confidence if contradiction found
+                confidence = max(0, confidence - 1.5)
+                remarks += " Note: There appears to be a slight inconsistency with your previous answers. Please ensure consistency."
+            
+            # Difficulty level
+            difficulty_level = eval_data.get('difficulty_level', 'Medium')
+            
+            # Follow-up needed
+            follow_up_needed = bool(eval_data.get('follow_up_needed', False))
+            follow_up_reason = eval_data.get('follow_up_reason', '')
+            
+            # Calculate overall score (weighted average)
+            # For TR: correctness 35%, clarity 25%, depth 25%, confidence 15%
+            # For HR: correctness 25%, clarity 30%, depth 20%, confidence 25%
+            if interview_type == 'TR':
+                overall_score = (correctness * 0.35 + clarity * 0.25 + depth * 0.25 + confidence * 0.15)
+            else:
+                overall_score = (correctness * 0.25 + clarity * 0.30 + depth * 0.20 + confidence * 0.25)
+            
+            return {
+                'feedback': remarks,
+                'correctness': round(correctness, 1),
+                'clarity': round(clarity, 1),
+                'depth': round(depth, 1),
+                'confidence': round(confidence, 1),
+                'overall_score': round(overall_score, 1),
+                'contradiction_detected': contradiction_detected,
+                'difficulty_level': difficulty_level,
+                'follow_up_needed': follow_up_needed,
+                'follow_up_reason': follow_up_reason
             }
-            
-            payload = {
-                'model': 'gpt-3.5-turbo',
-                'messages': [
-                    {'role': 'system', 'content': f'You are an experienced {interview_type} interview evaluator. Provide accurate scores and constructive feedback in JSON format.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                'max_tokens': 500,
-                'temperature': 0.5
-            }
-            
-            response = requests.post(Config.AI_API_URL, headers=headers, json=payload, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'choices' in data and len(data['choices']) > 0:
-                content = data['choices'][0]['message']['content'].strip()
-                
-                try:
-                    # Extract JSON from response
-                    json_match = re.search(r'\{[^{}]*"correctness"[^{}]*\}', content, re.DOTALL)
-                    if json_match:
-                        eval_data = json.loads(json_match.group())
-                    else:
-                        eval_data = json.loads(content)
-                    
-                    correctness = float(eval_data.get('correctness', 5))
-                    clarity = float(eval_data.get('clarity', 5))
-                    confidence = float(eval_data.get('confidence', 5))
-                    feedback = eval_data.get('feedback', 'Thank you for your answer.')
-                    
-                    # Calculate overall score (weighted average)
-                    # For TR: correctness 50%, clarity 30%, confidence 20%
-                    # For HR: correctness 30%, clarity 40%, confidence 30%
-                    if interview_type == 'TR':
-                        overall_score = (correctness * 0.5 + clarity * 0.3 + confidence * 0.2)
-                    else:
-                        overall_score = (correctness * 0.3 + clarity * 0.4 + confidence * 0.3)
-                    
-                    return {
-                        'feedback': feedback,
-                        'correctness': round(correctness, 1),
-                        'clarity': round(clarity, 1),
-                        'confidence': round(confidence, 1),
-                        'overall_score': round(overall_score, 1)
-                    }
-                except (json.JSONDecodeError, ValueError, KeyError) as e:
-                    print(f"Error parsing AI evaluation: {e}")
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            print(f"Error parsing AI evaluation: {e}")
+        except OpenAIError as e:
+            print(f"[Interview AI] OpenAI error: {e}")
         except Exception as e:
             print(f"AI API error: {e}")
     
@@ -656,8 +868,13 @@ Return your response in this EXACT JSON format:
         'feedback': get_fallback_feedback(interview_type, phase),
         'correctness': 6.0,
         'clarity': 6.0,
+        'depth': 6.0,
         'confidence': 6.0,
-        'overall_score': 6.0
+        'overall_score': 6.0,
+        'contradiction_detected': False,
+        'difficulty_level': 'Medium',
+        'follow_up_needed': False,
+        'follow_up_reason': ''
     }
 
 def get_fallback_feedback(interview_type, phase):
@@ -833,46 +1050,36 @@ Return ONLY valid JSON in this format:
     "suggested_resources": ["resource1", "resource2", ...]
 }}"""
         
-        headers = {
-            'Authorization': f'Bearer {Config.AI_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            'model': 'gpt-3.5-turbo',
-            'messages': [
+        # Use OpenAI client with retry logic
+        client = get_openai_client()
+        content = client.chat_completion(
+            messages=[
                 {'role': 'system', 'content': f'You are an interview coach providing comprehensive, constructive feedback for {interview_type} interviews. Return only valid JSON.'},
                 {'role': 'user', 'content': prompt}
             ],
-            'max_tokens': 800,
-            'temperature': 0.7
-        }
+            max_tokens=800,
+            temperature=0.7,
+            timeout=25
+        )
         
-        response = requests.post(Config.AI_API_URL, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'choices' in data and len(data['choices']) > 0:
-            content = data['choices'][0]['message']['content'].strip()
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{.*"summary".*\}', content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                result = json.loads(content)
             
-            try:
-                # Extract JSON from response
-                json_match = re.search(r'\{.*"summary".*\}', content, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                else:
-                    result = json.loads(content)
-                
-                return {
-                    'summary': result.get('summary', 'Interview completed.'),
-                    'strengths': result.get('strengths', []),
-                    'weaknesses': result.get('weaknesses', []),
-                    'weak_skills': result.get('weak_skills', []),
-                    'improvements': result.get('improvements', []),
-                    'suggested_resources': result.get('suggested_resources', [])
-                }
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                print(f"Error parsing AI summary: {e}")
+            return {
+                'summary': result.get('summary', 'Interview completed.'),
+                'strengths': result.get('strengths', []),
+                'weaknesses': result.get('weaknesses', []),
+                'weak_skills': result.get('weak_skills', []),
+                'improvements': result.get('improvements', []),
+                'suggested_resources': result.get('suggested_resources', [])
+            }
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            print(f"Error parsing AI summary: {e}")
     except Exception as e:
         print(f"Error generating summary: {e}")
     
@@ -930,49 +1137,50 @@ Return ONLY valid JSON array:
     ...
 ]"""
         
-        headers = {
-            'Authorization': f'Bearer {Config.AI_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            'model': 'gpt-3.5-turbo',
-            'messages': [
+        # Use OpenAI client with retry logic
+        try:
+            client = get_openai_client()
+            messages = [
                 {'role': 'system', 'content': 'You are an educational content generator. Return only valid JSON arrays.'},
                 {'role': 'user', 'content': prompt}
-            ],
-            'max_tokens': 800,
-            'temperature': 0.7
-        }
-        
-        response = requests.post(Config.AI_API_URL, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'choices' in data and len(data['choices']) > 0:
-            content = data['choices'][0]['message']['content'].strip()
+            ]
+            
+            content = client.chat_completion(
+                messages=messages,
+                max_tokens=800,
+                temperature=0.7,
+                timeout=25
+            )
             
             try:
                 # Extract JSON array from response
                 json_match = re.search(r'\[.*\]', content, re.DOTALL)
                 if json_match:
                     practice_data = json.loads(json_match.group())
-                    
-                    # Convert to dictionary keyed by skill name
-                    result = {}
-                    for item in practice_data:
-                        skill_name = item.get('skill_name', '')
-                        if skill_name:
-                            result[skill_name] = {
-                                'mcq_count': item.get('mcq_count', 0),
-                                'coding_count': item.get('coding_count', 0),
-                                'interview_questions_count': item.get('interview_questions_count', 0),
-                                'practice_description': item.get('practice_description', ''),
-                                'difficulty_level': item.get('difficulty_level', 'intermediate')
-                            }
-                    return result
+                else:
+                    practice_data = json.loads(content)
+                
+                # Convert to dictionary keyed by skill name
+                result = {}
+                for item in practice_data:
+                    skill_name = item.get('skill_name', '')
+                    if skill_name:
+                        result[skill_name] = {
+                            'mcq_count': item.get('mcq_count', 0),
+                            'coding_count': item.get('coding_count', 0),
+                            'interview_questions_count': item.get('interview_questions_count', 0),
+                            'practice_description': item.get('practice_description', ''),
+                            'difficulty_level': item.get('difficulty_level', 'intermediate')
+                        }
+                return result
             except (json.JSONDecodeError, ValueError, KeyError) as e:
                 print(f"Error parsing practice materials: {e}")
+        except OpenAIError as e:
+            # Handle rate limiting gracefully
+            if '429' in str(e) or 'rate limit' in str(e).lower() or 'quota' in str(e).lower():
+                print(f"[Practice Materials] OpenAI rate limit/quota exceeded. Returning empty result.")
+                return {}
+            raise
     except Exception as e:
         print(f"Error generating practice materials: {e}")
     

@@ -10,6 +10,29 @@ import os
 
 resources_bp = Blueprint('resources', __name__)
 
+@resources_bp.route('', methods=['GET'])
+@resources_bp.route('/', methods=['GET'])
+@jwt_required()
+def list_resources():
+    """List learning resources - accessible to authenticated users."""
+    try:
+        resource_type = request.args.get('type')
+        company_id = request.args.get('company_id')
+
+        query = Resource.query
+
+        if resource_type:
+            query = query.filter_by(type=resource_type)
+        if company_id:
+            query = query.filter_by(company_id=company_id)
+
+        resources = query.order_by(Resource.created_at.desc()).all()
+        return jsonify({
+            'resources': [resource.to_dict() for resource in resources]
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 def allowed_file(filename):
     """Check if file extension is allowed"""
     from config import Config
@@ -155,12 +178,18 @@ def delete_resource(resource_id):
         user_id = get_jwt_identity()
         resource = Resource.query.get_or_404(resource_id)
         
-        # Check ownership
-        if resource.user_id != user_id:
-            from utils.auth import get_current_user
-            user = get_current_user()
-            if not user or user.role != 'admin':
-                return jsonify({'error': 'Access denied'}), 403
+        from utils.auth import get_current_user
+        user = get_current_user()
+        seed_user = User.query.filter_by(username='seed_admin').first()
+        is_seed_resource = seed_user and resource.user_id == seed_user.id
+        can_delete = (
+            resource.user_id == int(user_id)
+            or (user and user.role in ['faculty', 'admin'])
+            or is_seed_resource
+        )
+
+        if not can_delete:
+            return jsonify({'error': 'Access denied'}), 403
         
         # Delete file if exists
         if resource.file_path and os.path.exists(resource.file_path):

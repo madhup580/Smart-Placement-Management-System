@@ -1,65 +1,184 @@
 """
-Code compiler integration utilities
+LeetCode-style Code Execution Engine
+Uses Piston API (free, sandboxed) as primary execution engine
 """
 import requests
 import json
 import subprocess
 import tempfile
 import os
+import re
+import sys
 import time
 import platform
 from config import Config
 
-def execute_code(code, language, stdin=''):
+# Language-specific time and memory limits (in seconds and MB)
+LANGUAGE_LIMITS = {
+    'python': {'time': 10, 'memory': 256},
+    'cpp': {'time': 5, 'memory': 256},
+    'c': {'time': 5, 'memory': 256},
+    'java': {'time': 10, 'memory': 512}
+}
+
+# Piston API endpoint (free, open-source, sandboxed)
+PISTON_API_URL = 'https://emkc.org/api/v2/piston/execute'
+
+def execute_code(code, language, stdin='', time_limit=None, memory_limit=None):
     """
-    Execute code using online compiler API or local compilation
-    Returns: (output, status, execution_time, memory)
+    Execute code using Piston API (sandboxed, LeetCode-style)
+    Returns: (output, status, execution_time, memory_used)
+    
+    Status values:
+    - 'accepted': Code executed successfully
+    - 'compilation_error': Compilation failed
+    - 'runtime_error': Runtime error occurred
+    - 'time_limit_exceeded': Execution exceeded time limit
+    - 'memory_limit_exceeded': Execution exceeded memory limit
+    - 'error': Other errors
     """
-    language_map = {
-        'c': 'c',
-        'cpp': 'cpp17',
-        'python': 'python3',
-        'java': 'java'
-    }
+    # Get language-specific limits
+    limits = LANGUAGE_LIMITS.get(language, {'time': 10, 'memory': 256})
+    time_limit = time_limit or limits['time']
+    memory_limit = memory_limit or limits['memory']
     
-    # If compiler API is configured, use it
-    if Config.COMPILER_CLIENT_ID:
-        payload = {
-            'clientId': Config.COMPILER_CLIENT_ID,
-            'clientSecret': Config.COMPILER_CLIENT_SECRET,
-            'script': code,
-            'language': language_map.get(language, language),
-            'stdin': stdin,
-            'versionIndex': '0'
-        }
-        
-        try:
-            response = requests.post(Config.COMPILER_API_URL, json=payload, timeout=10)
-            data = response.json()
-            
-            output = data.get('output', '')
-            status = 'accepted' if data.get('statusCode') == 200 else 'runtime_error'
-            execution_time = data.get('cpuTime', 0.0)
-            memory = data.get('memory', 0.0)
-            
-            return output, status, execution_time, memory
-        except Exception as e:
-            return str(e), 'runtime_error', 0.0, 0.0
-    
-    # Fallback: Local execution
+    # Prefer local execution so coding practice works without depending on
+    # external compiler API credentials or availability.
+    if language == 'python':
+        return _execute_python_subprocess(code, stdin, time_limit)
+    if language == 'cpp':
+        return _execute_cpp(code, stdin)
+    if language == 'c':
+        return _execute_c(code, stdin)
+    if language == 'java':
+        return _execute_java(code, stdin)
+
+    return _execute_with_piston(code, language, stdin, time_limit, memory_limit)
+
+def _execute_python_subprocess(code, stdin='', time_limit=10):
+    """Execute Python code locally in a subprocess with a timeout."""
+    temp_dir = tempfile.mkdtemp()
     try:
-        if language == 'python':
-            return _execute_python(code, stdin)
-        elif language == 'cpp':
-            return _execute_cpp(code, stdin)
-        elif language == 'c':
-            return _execute_c(code, stdin)
-        elif language == 'java':
-            return _execute_java(code, stdin)
-        else:
-            return f"Unsupported language: {language}", 'error', 0.0, 0.0
+        code_file = os.path.join(temp_dir, 'main.py')
+        with open(code_file, 'w', encoding='utf-8') as f:
+            f.write(code)
+
+        start_time = time.time()
+        run_result = subprocess.run(
+            [sys.executable, code_file],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=time_limit,
+            cwd=temp_dir
+        )
+        execution_time = time.time() - start_time
+
+        if run_result.returncode != 0:
+            return run_result.stderr or run_result.stdout or 'Runtime error', 'runtime_error', execution_time, 0.0
+
+        return run_result.stdout, 'accepted', execution_time, 0.0
+    except subprocess.TimeoutExpired:
+        return "Time Limit Exceeded", 'time_limit_exceeded', time_limit, 0.0
     except Exception as e:
         return str(e), 'runtime_error', 0.0, 0.0
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
+
+def _execute_with_piston(code, language, stdin='', time_limit=10, memory_limit=256):
+    """
+    Execute code using Piston API (free, sandboxed execution engine)
+    Piston provides secure sandboxed execution similar to LeetCode
+    """
+    try:
+        # Map language names to Piston language identifiers
+        lang_map = {
+            'python': 'python3',
+            'cpp': 'cpp',
+            'c': 'c',
+            'java': 'java'
+        }
+        
+        piston_lang = lang_map.get(language, language)
+        
+        # Prepare payload for Piston API
+        payload = {
+            'language': piston_lang,
+            'version': '*',  # Use latest version
+            'files': [
+                {
+                    'content': code
+                }
+            ],
+            'stdin': stdin,
+            'compile_timeout': min(time_limit * 1000, 10000),  # Compilation timeout in ms
+            'run_timeout': time_limit * 1000,  # Execution timeout in ms
+            'memory_limit': memory_limit * 1024 * 1024  # Memory limit in bytes
+        }
+        
+        # Make request to Piston API
+        response = requests.post(PISTON_API_URL, json=payload, timeout=time_limit + 5)
+        
+        if response.status_code != 200:
+            return f"API error: {response.status_code}", 'error', 0.0, 0.0
+        
+        data = response.json()
+        
+        # Check for compilation errors
+        if 'compile' in data:
+            compile_data = data['compile']
+            if compile_data.get('stderr'):
+                return compile_data['stderr'], 'compilation_error', 0.0, 0.0
+        
+        # Check for runtime execution
+        if 'run' in data:
+            run_data = data['run']
+            stdout = run_data.get('stdout', '')
+            stderr = run_data.get('stderr', '')
+            
+            # Check for timeout
+            if run_data.get('signal') == 'SIGKILL' or 'timeout' in stderr.lower():
+                return "Time Limit Exceeded", 'time_limit_exceeded', time_limit, 0.0
+            
+            # Check for memory issues
+            if 'memory' in stderr.lower() or run_data.get('signal') == 'SIGSEGV':
+                return "Memory Limit Exceeded", 'memory_limit_exceeded', 0.0, memory_limit
+            
+            # If there's stderr, it's a runtime error
+            if stderr:
+                return stderr, 'runtime_error', 0.0, 0.0
+            
+            # Calculate execution time
+            execution_time = 0.0
+            if 'time' in run_data:
+                try:
+                    # Piston returns time in seconds
+                    execution_time = float(run_data['time'])
+                except:
+                    pass
+            
+            # Get memory usage if available
+            memory_used = 0.0
+            if 'memory' in run_data:
+                try:
+                    memory_used = float(run_data['memory']) / (1024 * 1024)  # Convert to MB
+                except:
+                    pass
+            
+            return stdout, 'accepted', execution_time, memory_used
+        else:
+            return "Unknown error from execution engine", 'error', 0.0, 0.0
+            
+    except requests.exceptions.Timeout:
+        return "Time Limit Exceeded", 'time_limit_exceeded', time_limit, 0.0
+    except requests.exceptions.RequestException as e:
+        return f"Execution engine error: {str(e)}", 'error', 0.0, 0.0
+    except Exception as e:
+        return f"Error: {str(e)}", 'error', 0.0, 0.0
 
 def _execute_python(code, stdin=''):
     """Execute Python code locally"""
@@ -218,13 +337,18 @@ def _execute_java(code, stdin=''):
     """Execute Java code locally"""
     temp_dir = tempfile.mkdtemp()
     try:
-        # Extract class name from code (assume public class exists)
-        class_name = 'Main'
+        # Java needs the source filename to match the public class, while the
+        # judge wrapper may still need to run its generated Main class.
+        file_class_name = 'Main'
+        run_class_name = 'Main'
         if 'public class' in code:
-            class_name = code.split('public class')[1].split()[0].split('{')[0].strip()
+            file_class_name = code.split('public class')[1].split()[0].split('{')[0].strip()
+            run_class_name = file_class_name
+        if re.search(r'\bclass\s+Main\b', code) and re.search(r'public\s+static\s+void\s+main\s*\(', code):
+            run_class_name = 'Main'
         
         # Write code to file
-        code_file = os.path.join(temp_dir, f'{class_name}.java')
+        code_file = os.path.join(temp_dir, f'{file_class_name}.java')
         with open(code_file, 'w', encoding='utf-8') as f:
             f.write(code)
         
@@ -250,7 +374,7 @@ def _execute_java(code, stdin=''):
         
         start_time = time.time()
         run_result = subprocess.run(
-            ['java', '-cp', temp_dir, class_name],
+            ['java', '-cp', temp_dir, run_class_name],
             input=stdin,
             capture_output=True,
             text=True,

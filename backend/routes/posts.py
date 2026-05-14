@@ -19,80 +19,127 @@ def allowed_file(filename):
 @jwt_required()
 @role_required(['student', 'faculty', 'admin'])
 def create_post():
-    """Create a new company post with text content or file upload"""
+    """Create a new company post with MCQ question and optional file upload"""
     try:
         user_id = get_jwt_identity()
         
-        # Get form data
-        title = request.form.get('title')
-        company_name = request.form.get('company_name')
-        content_type = request.form.get('content_type', 'text')  # 'text' or 'file'
-        content = request.form.get('content', '')
-        post_type = request.form.get('post_type', 'experience')
-        tags = request.form.get('tags', '')
+        # Get form data (all fields are optional)
+        company_name = request.form.get('company_name', '').strip()
+        question = request.form.get('question', '').strip()
+        options_json = request.form.get('options', '[]')
+        correct_answer = request.form.get('correct_answer', '')
+        description = request.form.get('description', '').strip()
         
-        # Validate required fields
-        if not title or not company_name:
-            return jsonify({'error': 'Title and company name are required'}), 400
+        # Validate that at least some content is provided
+        has_content = False
+        if company_name:
+            has_content = True
+        if question:
+            has_content = True
+        if description:
+            has_content = True
+        if 'file' in request.files and request.files['file'].filename:
+            has_content = True
         
-        # Find or create company
-        company = Company.query.filter_by(name=company_name).first()
-        if not company:
-            # Create new company if it doesn't exist
-            company = Company(
-                name=company_name,
-                description=f'Company: {company_name}'
-            )
-            db.session.add(company)
-            db.session.flush()  # Get the ID without committing
+        if not has_content:
+            return jsonify({'error': 'Please provide at least company name, question, description, or file'}), 400
         
-        company_id = company.id
+        # Parse options if provided
+        import json
+        options = []
+        if options_json:
+            try:
+                options = json.loads(options_json) if isinstance(options_json, str) else options_json
+            except:
+                options = []
         
-        # Handle file upload
+        # If question is provided, validate options and correct answer
+        if question:
+            if len(options) < 2:
+                return jsonify({'error': 'At least 2 options are required when providing a question'}), 400
+            if not correct_answer:
+                return jsonify({'error': 'Correct answer is required when providing a question'}), 400
+        
+        # Find or create company (if company name provided)
+        company_id = None
+        if company_name:
+            company = Company.query.filter_by(name=company_name).first()
+            if not company:
+                # Create new company if it doesn't exist
+                company = Company(
+                    name=company_name,
+                    description=f'Company: {company_name}'
+                )
+                db.session.add(company)
+                db.session.flush()  # Get the ID without committing
+            
+            company_id = company.id
+        else:
+            # If no company name, use a default or create a generic one
+            company = Company.query.filter_by(name='General').first()
+            if not company:
+                company = Company(
+                    name='General',
+                    description='General interview questions'
+                )
+                db.session.add(company)
+                db.session.flush()
+            company_id = company.id
+        
+        # Handle file upload (optional)
         file_path = None
         file_type = None
         
-        if content_type == 'file':
-            if 'file' not in request.files:
-                return jsonify({'error': 'No file provided'}), 400
-            
+        if 'file' in request.files:
             file = request.files['file']
-            if file.filename == '':
-                return jsonify({'error': 'No file selected'}), 400
-            
-            if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                file_ext = filename.rsplit('.', 1)[1].lower()
-                
-                # Ensure upload folder exists
-                os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-                file_path = os.path.join(Config.UPLOAD_FOLDER, f"post_{user_id}_{filename}")
-                file.save(file_path)
-                file_path = os.path.abspath(file_path)
-                file_type = file_ext
-            else:
-                return jsonify({'error': 'Invalid file type. Only PDF, JPG, PNG are allowed'}), 400
-        else:
-            # Text content
-            if not content:
-                return jsonify({'error': 'Content is required'}), 400
+            if file.filename != '':
+                if file and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    file_ext = filename.rsplit('.', 1)[1].lower()
+                    
+                    # Ensure upload folder exists
+                    os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+                    file_path = os.path.join(Config.UPLOAD_FOLDER, f"post_{user_id}_{filename}")
+                    file.save(file_path)
+                    file_path = os.path.abspath(file_path)
+                    file_type = file_ext
+                else:
+                    return jsonify({'error': 'Invalid file type. Only PDF, JPG, PNG are allowed'}), 400
         
+        # Create MCQ question data structure (only if question data provided)
+        mcq_questions_json = None
+        if question and options and correct_answer:
+            mcq_question = {
+                'question': question,
+                'options': options,
+                'correct_answer': correct_answer
+            }
+            mcq_questions_json = json.dumps([mcq_question])
+        
+        # Generate title
+        title = f"{company_name} - Interview Question" if company_name else "Interview Question"
+        if not company_name and not question:
+            title = "Interview Post"
+        
+        # Create post with question data
         post = Post(
             title=title,
-            content=content if content_type == 'text' else None,
+            content=description if description else None,  # Store description in content field
             file_path=file_path,
             file_type=file_type,
             company_id=int(company_id),
             user_id=user_id,
-            post_type=post_type,
-            tags=tags
+            post_type='question',
+            tags='',
+            mcq_questions=mcq_questions_json,  # Store as array with single question or None
+            coding_questions=None
         )
         
         db.session.add(post)
         db.session.commit()
         
         return jsonify({
-            'message': 'Post created successfully',
+            'message': 'Question added successfully',
             'post': post.to_dict()
         }), 201
     

@@ -39,8 +39,10 @@ def execute_run_mode(code, language, stdin='', sample_input=None):
     # The wrapper functions check if main() exists and only wrap if needed
     wrapped_code = wrap_code_for_run(code, language, sample_input)
     
-    # Execute normally
-    output, status, exec_time, memory = execute_code(wrapped_code, language, stdin)
+    # Execute normally. If the editor does not provide custom stdin, run with
+    # the visible sample input so practice runs work immediately.
+    run_stdin = stdin if stdin else (sample_input or '')
+    output, status, exec_time, memory = execute_code(wrapped_code, language, run_stdin)
     
     return {
         'output': output,
@@ -56,16 +58,17 @@ def execute_run_mode(code, language, stdin='', sample_input=None):
 
 def execute_submit_mode(code, language, test_cases):
     """
-    Submit mode: Judge code by calling solution functions directly
-    - Do NOT execute user code as a program
-    - Do NOT rely on printed output
-    - Do NOT require main()
-    - Platform supplies inputs
-    - Extract solution function
-    - Call it programmatically
-    - Capture return value
-    - Compare with expected output
+    LeetCode-style Submit Mode: Judge code against multiple hidden test cases
+    - Execute code in sandboxed environment (Piston API)
+    - Run against ALL test cases (hidden from user)
+    - Return proper verdicts: Accepted, Wrong Answer, Runtime Error, etc.
+    - Do NOT expose test case details to students
     """
+    from utils.compiler import execute_code, LANGUAGE_LIMITS
+    
+    # Get language-specific limits
+    limits = LANGUAGE_LIMITS.get(language, {'time': 10, 'memory': 256})
+    
     # Extract solution function (remove main if present)
     solution_code = extract_solution_function(code, language)
     
@@ -73,85 +76,346 @@ def execute_submit_mode(code, language, test_cases):
         return {
             'passed': 0,
             'total': len(test_cases),
-            'results': [{
-                'test_case': i + 1,
-                'input': tc.get('input', ''),
-                'expected_output': tc.get('output', ''),
-                'actual_output': 'Could not extract solution function',
-                'passed': False,
-                'status': 'error',
-                'execution_time': 0.0
-            } for i, tc in enumerate(test_cases)],
-            'status': 'error',
+            'results': [],
+            'status': 'compilation_error',
+            'verdict': 'Compilation Error',
+            'message': 'Could not extract solution function',
+            'execution_time': 0.0,
             'mode': ExecutionMode.SUBMIT
         }
     
-    # Run test cases
+    # Run test cases - ALL test cases are hidden from user
     passed = 0
     total = len(test_cases)
     results = []
+    first_error = None
+    first_error_status = None
+    max_execution_time = 0.0
     
     for i, test_case in enumerate(test_cases):
         input_str = test_case.get('input', '')
         expected_output_str = test_case.get('output', '').strip()
         
-        # Parse inputs
-        try:
-            inputs = parse_test_case_input(input_str)
-        except Exception as e:
-            results.append({
-                'test_case': i + 1,
-                'input': input_str,
-                'expected_output': expected_output_str,
-                'actual_output': f'Input parsing error: {str(e)}',
-                'passed': False,
-                'status': 'error',
-                'execution_time': 0.0
-            })
-            continue
+        # Build executable code with test case input
+        executable_code = build_executable_code(solution_code, language, input_str)
         
-        # Call solution function programmatically
-        start_time = time.time()
-        actual_result, status = call_solution_function(solution_code, language, inputs)
-        execution_time = time.time() - start_time
+        # Execute code with time and memory limits
+        output, status, exec_time, memory = execute_code(
+            executable_code, 
+            language, 
+            stdin='',
+            time_limit=limits['time'],
+            memory_limit=limits['memory']
+        )
         
-        # Format and compare outputs
-        actual_output_str = format_output(actual_result) if actual_result is not None else ''
-        expected_output_str = expected_output_str.replace(' ', '')
-        actual_output_str = actual_output_str.replace(' ', '')
+        max_execution_time = max(max_execution_time, exec_time)
         
-        # Normalize and compare
-        is_passed = normalize_and_compare(actual_output_str, expected_output_str) and status == 'accepted'
+        # Determine verdict for this test case
+        verdict = _get_verdict(status, output, expected_output_str)
         
-        if is_passed:
-            passed += 1
+        # Check if test case passed
+        if status == 'accepted':
+            actual_output = output.strip()
+            is_passed = _compare_outputs(actual_output, expected_output_str)
+            
+            if is_passed:
+                passed += 1
+                verdict = 'Accepted'
+            else:
+                verdict = 'Wrong Answer'
+                if not first_error:
+                    first_error = f"Expected: {expected_output_str[:100]}, Got: {actual_output[:100]}"
+                    first_error_status = 'wrong_answer'
+        else:
+            # Compilation error, runtime error, timeout, etc.
+            if not first_error:
+                first_error = output[:200] if output else status
+                first_error_status = status
+            verdict = _get_verdict(status, output, expected_output_str)
         
+        # Store result (but don't expose input/output details to user)
         results.append({
             'test_case': i + 1,
-            'input': input_str,
-            'expected_output': expected_output_str,
-            'actual_output': actual_output_str if status == 'accepted' else str(actual_result),
-            'passed': is_passed,
+            'passed': verdict == 'Accepted',
             'status': status,
-            'execution_time': execution_time
+            'verdict': verdict,
+            'execution_time': exec_time
         })
     
-    # Determine overall status
+    # Determine overall verdict (LeetCode-style)
     if passed == total:
+        overall_verdict = 'Accepted'
         overall_status = 'accepted'
-    elif passed > 0:
-        overall_status = 'wrong_answer'
+        message = f'All {total} test cases passed!'
+    elif first_error_status == 'compilation_error':
+        overall_verdict = 'Compilation Error'
+        overall_status = 'compilation_error'
+        message = first_error or 'Compilation failed'
+    elif first_error_status == 'time_limit_exceeded':
+        overall_verdict = 'Time Limit Exceeded'
+        overall_status = 'time_limit_exceeded'
+        message = f'Execution exceeded time limit of {limits["time"]} seconds'
+    elif first_error_status == 'memory_limit_exceeded':
+        overall_verdict = 'Memory Limit Exceeded'
+        overall_status = 'memory_limit_exceeded'
+        message = f'Execution exceeded memory limit of {limits["memory"]} MB'
+    elif first_error_status == 'runtime_error':
+        overall_verdict = 'Runtime Error'
+        overall_status = 'runtime_error'
+        message = first_error or 'Runtime error occurred'
     else:
+        overall_verdict = 'Wrong Answer'
         overall_status = 'wrong_answer'
+        message = f'Passed {passed}/{total} test cases'
     
     return {
         'passed': passed,
         'total': total,
-        'results': results,
+        'results': results,  # Results without exposing test case details
         'status': overall_status,
-        'execution_time': sum(r['execution_time'] for r in results) / len(results) if results else 0.0,
+        'verdict': overall_verdict,
+        'message': message,
+        'execution_time': max_execution_time,
         'mode': ExecutionMode.SUBMIT
     }
+
+def _get_verdict(status, output, expected_output):
+    """Get human-readable verdict from status"""
+    verdict_map = {
+        'accepted': 'Accepted',
+        'compilation_error': 'Compilation Error',
+        'runtime_error': 'Runtime Error',
+        'time_limit_exceeded': 'Time Limit Exceeded',
+        'memory_limit_exceeded': 'Memory Limit Exceeded',
+        'error': 'Error'
+    }
+    return verdict_map.get(status, 'Error')
+
+def _compare_outputs(actual, expected):
+    """Compare actual and expected outputs (LeetCode-style)"""
+    # Normalize whitespace
+    actual = actual.strip().replace('\r\n', '\n').replace('\r', '\n')
+    expected = expected.strip().replace('\r\n', '\n').replace('\r', '\n')
+
+    if actual == expected:
+        return True
+    
+    # Try JSON comparison for structured data
+    try:
+        import json
+        actual_json = json.loads(actual)
+        expected_json = json.loads(expected)
+        
+        # For exact structured matches, accept immediately. If JSON parses but
+        # shapes differ (for example [-1] vs -1), continue to numeric parsing.
+        if actual_json == expected_json:
+            return True
+    except:
+        pass
+
+    actual_numbers = _parse_numeric_output(actual)
+    expected_numbers = _parse_numeric_output(expected)
+    if actual_numbers is not None and expected_numbers is not None:
+        return actual_numbers == expected_numbers
+    
+    # String comparison (normalized)
+    return actual == expected
+
+def _parse_numeric_output(value):
+    """Parse numeric judge output in either '[0,1]' or '0 1' style."""
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    if not re.fullmatch(r'[\s,\[\]\(\)\{\}\-+\d.]+', cleaned):
+        return None
+
+    numbers = re.findall(r'[-+]?\d+(?:\.\d+)?', cleaned)
+    if not numbers:
+        return None
+
+    parsed = []
+    for number in numbers:
+        parsed.append(float(number) if '.' in number else int(number))
+    return parsed
+
+def build_executable_code(solution_code, language, input_str):
+    """Build executable code with test case input embedded"""
+    # Parse input
+    try:
+        inputs = parse_test_case_input(input_str)
+    except:
+        inputs = input_str
+    
+    if language == 'python':
+        return _build_python_executable(solution_code, inputs)
+    elif language == 'cpp':
+        return _build_cpp_executable(solution_code, inputs)
+    elif language == 'c':
+        return _build_c_executable(solution_code, inputs)
+    elif language == 'java':
+        return _build_java_executable(solution_code, inputs)
+    return solution_code
+
+def _build_python_executable(solution_code, inputs):
+    """Build executable Python code"""
+    # Try Solution class
+    if 'class Solution' in solution_code:
+        # Find method name
+        import re
+        method_match = re.search(r'def\s+(\w+)\s*\(', solution_code)
+        if method_match:
+            method_name = method_match.group(1)
+            if isinstance(inputs, (list, tuple)) and len(inputs) >= 2:
+                return f"""{solution_code}
+
+if __name__ == "__main__":
+    solution = Solution()
+    result = solution.{method_name}({inputs[0]}, {inputs[1]})
+    print(result)
+"""
+            elif isinstance(inputs, (list, tuple)):
+                return f"""{solution_code}
+
+if __name__ == "__main__":
+    solution = Solution()
+    result = solution.{method_name}({inputs[0]})
+    print(result)
+"""
+    
+    # Try standalone function
+    import re
+    func_match = re.search(r'def\s+(\w+)\s*\(', solution_code)
+    if func_match:
+        func_name = func_match.group(1)
+        if isinstance(inputs, (list, tuple)):
+            args = ', '.join(repr(inp) for inp in inputs)
+            return f"""{solution_code}
+
+if __name__ == "__main__":
+    result = {func_name}({args})
+    print(result)
+"""
+        else:
+            return f"""{solution_code}
+
+if __name__ == "__main__":
+    result = {func_name}({inputs})
+    print(result)
+"""
+    
+    return solution_code
+
+def _build_cpp_executable(solution_code, inputs):
+    """Build executable C++ code"""
+    import re
+    # Find Solution class and method
+    method_match = re.search(r'(\w+)\s*\([^)]*\)\s*\{', solution_code)
+    method_name = method_match.group(1) if method_match else 'twoSum'
+    
+    # Parse inputs
+    nums = []
+    target = 0
+    if isinstance(inputs, (list, tuple)) and len(inputs) >= 2:
+        nums = list(inputs[0]) if isinstance(inputs[0], (list, tuple)) else [inputs[0]]
+        target = inputs[1]
+    elif isinstance(inputs, (list, tuple)):
+        nums = list(inputs[0]) if isinstance(inputs[0], (list, tuple)) else [inputs[0]]
+    
+    nums_str = ', '.join(map(str, nums)) if nums else '0'
+    
+    return f"""#include <iostream>
+#include <vector>
+using namespace std;
+
+{solution_code}
+
+int main() {{
+    Solution solution;
+    vector<int> nums = {{{nums_str}}};
+    int target = {target};
+    vector<int> result = solution.{method_name}(nums, target);
+    cout << "[";
+    for (int i = 0; i < result.size(); i++) {{
+        if (i > 0) cout << ",";
+        cout << result[i];
+    }}
+    cout << "]";
+    return 0;
+}}
+"""
+
+def _build_c_executable(solution_code, inputs):
+    """Build executable C code"""
+    import re
+    func_match = re.search(r'(\w+)\s*\([^)]*\)\s*\{', solution_code)
+    func_name = func_match.group(1) if func_match else 'twoSum'
+    
+    nums = []
+    target = 0
+    if isinstance(inputs, (list, tuple)) and len(inputs) >= 2:
+        nums = list(inputs[0]) if isinstance(inputs[0], (list, tuple)) else [inputs[0]]
+        target = inputs[1]
+    
+    nums_str = ', '.join(map(str, nums)) if nums else '0'
+    
+    return f"""#include <stdio.h>
+#include <stdlib.h>
+
+{solution_code}
+
+int main() {{
+    int nums[] = {{{nums_str}}};
+    int numsSize = {len(nums)};
+    int target = {target};
+    int returnSize;
+    int* result = {func_name}(nums, numsSize, target, &returnSize);
+    if (result != NULL) {{
+        printf("[");
+        for (int i = 0; i < returnSize; i++) {{
+            if (i > 0) printf(",");
+            printf("%d", result[i]);
+        }}
+        printf("]");
+        free(result);
+    }}
+    return 0;
+}}
+"""
+
+def _build_java_executable(solution_code, inputs):
+    """Build executable Java code"""
+    import re
+    method_match = re.search(r'public\s+(?:static\s+)?[\w<>\[\], ?]+\s+(\w+)\s*\([^)]*\)', solution_code)
+    method_name = method_match.group(1) if method_match else 'twoSum'
+    
+    nums = []
+    target = 0
+    if isinstance(inputs, (list, tuple)) and len(inputs) >= 2:
+        nums = list(inputs[0]) if isinstance(inputs[0], (list, tuple)) else [inputs[0]]
+        target = inputs[1]
+    
+    nums_str = ', '.join(map(str, nums)) if nums else '0'
+    
+    return f"""import java.util.*;
+
+{solution_code}
+
+class Main {{
+    public static void main(String[] args) {{
+        Solution solution = new Solution();
+        int[] nums = {{{nums_str}}};
+        int target = {target};
+        int[] result = solution.{method_name}(nums, target);
+        System.out.print("[");
+        for (int i = 0; i < result.length; i++) {{
+            if (i > 0) System.out.print(",");
+            System.out.print(result[i]);
+        }}
+        System.out.print("]");
+    }}
+}}
+"""
 
 # ============================================================================
 # 4️⃣ INPUT HANDLING
@@ -215,6 +479,18 @@ def parse_test_case_input(input_str):
                 except:
                     parsed.append(line)
     
+    # Common coding-practice format:
+    # n
+    # a1 a2 ... an
+    # target
+    if (
+        len(parsed) >= 3
+        and isinstance(parsed[0], int)
+        and isinstance(parsed[1], list)
+        and isinstance(parsed[2], int)
+    ):
+        return [parsed[1], parsed[2]]
+
     return parsed if len(parsed) > 1 else (parsed[0] if parsed else None)
 
 # ============================================================================
@@ -538,7 +814,7 @@ int main() {{
 def call_java_function(solution_code, inputs):
     """Call Java function - platform provides Main class internally"""
     # Detect method name
-    method_match = re.search(r'public\s+\w+\s+(\w+)\s*\([^)]*\)', solution_code)
+    method_match = re.search(r'public\s+(?:static\s+)?[\w<>\[\], ?]+\s+(\w+)\s*\([^)]*\)', solution_code)
     method_name = method_match.group(1) if method_match else 'twoSum'
     
     # Parse inputs - ensure proper format
@@ -995,7 +1271,7 @@ def wrap_java_for_run(code, sample_input=None):
     if re.search(r'public\s+static\s+void\s+main\s*\(', code):
         return code
     
-    method_match = re.search(r'public\s+\w+\s+(\w+)\s*\([^)]*\)', code)
+    method_match = re.search(r'public\s+(?:static\s+)?[\w<>\[\], ?]+\s+(\w+)\s*\([^)]*\)', code)
     if not method_match:
         return code
     
